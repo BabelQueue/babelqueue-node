@@ -1,0 +1,63 @@
+{
+  "name": "@babelqueue/core",
+  "version": "0.1.0",
+  "description": "Polyglot Queues, Simplified — the Node/TypeScript core: the canonical BabelQueue wire-envelope codec, contracts and dead-letter helpers.",
+  "keywords": [
+    "queue",
+    "polyglot",
+    "microservices",
+    "json",
+    "envelope",
+    "messaging",
+    "rabbitmq",
+    "redis"
+  ],
+  "homepage": "https://babelqueue.com",
+  "bugs": {
+    "url": "https://github.com/BabelQueue/babelqueue-node/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BabelQueue/babelqueue-node.git"
+  },
+  "license": "MIT",
+  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/codec.test.ts test/dead-letter.test.ts test/conformance.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsup": "^8",
+    "tsx": "^4",
+    "typescript": "^5.5"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

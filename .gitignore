@@ -1,0 +1,15 @@
+# Dependencies & build output
+node_modules/
+dist/
+
+# Logs & caches
+*.log
+*.tsbuildinfo
+coverage/
+.npm/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
