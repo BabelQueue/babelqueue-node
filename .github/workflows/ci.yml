@@ -34,6 +34,32 @@ jobs:
       - name: Test
         run: npm test
 
+  lint:
+    name: Static analysis (ESLint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: ESLint
+        run: npm run lint
+
+  coverage:
+    name: Coverage gate (>=90%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Coverage
+        run: npm run coverage
+
   conformance:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
@@ -46,3 +72,16 @@ jobs:
           diff -ru "$RUNNER_TEMP/conformance/fixtures"      "test/conformance/fixtures"
           diff -ru "$RUNNER_TEMP/conformance/schema"        "test/conformance/schema"
           echo "Vendored conformance is in sync with the canonical suite."
+
+  ci-green:
+    name: CI green
+    runs-on: ubuntu-latest
+    needs: [test, lint, coverage, conformance]
+    if: ${{ always() }}
+    steps:
+      - name: Fail if any required job did not pass
+        run: |
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}; then
+            echo "A required job failed or was cancelled."
+            exit 1
+          fi

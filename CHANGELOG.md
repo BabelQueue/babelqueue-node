@@ -9,6 +9,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-07
+
+**1.0.0 — the public API is now SemVer-stable**: breaking changes require a MAJOR,
+following the deprecation policy. The wire envelope is unchanged
+(`schema_version: 1`). Full reference at [babelqueue.com](https://babelqueue.com).
+
+### Internal
+- CI adds **ESLint** (`@eslint/js` + `typescript-eslint`) and a **c8 coverage gate**
+  (`npm run coverage`, ≥90% lines/functions, ≥85% branches) as separate jobs;
+  `tsc --strict` typecheck already ran. `npm run lint` for local use.
+- **GR-8 latency benchmark** (`test/overhead.test.ts`) — asserts the envelope
+  encode/decode path adds **≤2%** over plain-JSON serialization vs a conservative
+  750µs broker round-trip.
+
 ## [0.1.0] - 2026-06-06
 
 ### Added
@@ -34,5 +48,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - **Zero runtime dependencies**; Node `>=18`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-node/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-node/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/BabelQueue/babelqueue-node/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/BabelQueue/babelqueue-node/releases/tag/v0.1.0
