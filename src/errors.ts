@@ -13,3 +13,18 @@ export class UnknownUrnError extends BabelQueueError {
     this.name = "UnknownUrnError";
   }
 }
+
+/**
+ * Raised when a message's `data` does not match the JSON Schema registered for its URN
+ * (ADR-0024). The consumer-side {@link schema.wrap} throws it so the adapter redelivers
+ * (and eventually dead-letters) a poison message.
+ */
+export class InvalidPayloadError extends BabelQueueError {
+  constructor(
+    readonly urn: string,
+    readonly violation: string,
+  ) {
+    super(`Message data for "${urn}" does not match its URN schema: ${violation}.`);
+    this.name = "InvalidPayloadError";
+  }
+}
