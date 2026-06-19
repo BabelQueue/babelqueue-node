@@ -38,3 +38,12 @@ export type { Handler, Store } from "./idempotency.js";
 
 export * as schema from "./schema.js";
 export type { SchemaProvider, SchemaNode } from "./schema.js";
+
+export { redrive, resetForRedrive } from "./redrive.js";
+export type {
+  RedriveIO,
+  RedriveItem,
+  RedriveMessage,
+  RedriveOptions,
+  RedriveResult,
+} from "./redrive.js";
