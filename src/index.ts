@@ -23,7 +23,7 @@ export type {
   Meta,
 } from "./codec.js";
 
-export type { HasTraceId, PolyglotMessage } from "./contracts.js";
+export type { HasTraceId, HeaderCarrier, PolyglotMessage } from "./contracts.js";
 
 export { annotate } from "./deadLetter.js";
 export type { AnnotateOptions } from "./deadLetter.js";

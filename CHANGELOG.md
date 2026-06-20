@@ -9,6 +9,27 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **OpenTelemetry v0.2 — W3C `traceparent` cross-hop span linkage (ADR-0028).** The
+  `@babelqueue/core/otel` module now propagates the active span as a W3C `traceparent`
+  (and `tracestate`) **transport header** so a consumer span is a true **child** of the
+  producer span — not just a shared `trace_id` trace.
+  - New `HeaderCarrier` type (a `Record<string, string>` out-of-band header map) — the
+    seam the core and the `babelqueue-node-adapters` transports agree on. It rides
+    **beside** the frozen envelope, never inside it (`schema_version` stays **1**, GR-1).
+  - `publish(...)` takes an optional `options.headers` carrier and writes the producer
+    span's `traceparent` into it; `wrapHandler(tracer, handler, headers?)` reads a
+    delivered message's headers (a carrier or a sync/async getter) and starts the consumer
+    span as a remote-parent child. **No header ⇒ v0.1 `trace_id` fallback** (no regression);
+    fully opt-in and backward compatible.
+  - New low-level exports `injectTraceparent`, `remoteParentFromHeaders`,
+    `HEADER_TRACEPARENT`, `HEADER_TRACESTATE`. The W3C parse/format is implemented against
+    the frozen Trace Context format, so the optional dependency stays at `@opentelemetry/api`
+    only — the core itself remains zero-runtime-dependency (GR-7).
+  - **Per-adapter transport wiring** (bullmq/redis/rabbitmq/sqs in the separate
+    `babelqueue-node-adapters` repo) is a documented follow-up; until wired, propagation
+    degrades to v0.1 `trace_id` correlation with no error.
+
 ## [1.0.0] - 2026-06-07
 
 **1.0.0 — the public API is now SemVer-stable**: breaking changes require a MAJOR,
