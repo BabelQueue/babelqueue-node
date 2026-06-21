@@ -37,7 +37,19 @@ export { Wrap, InMemoryStore } from "./idempotency.js";
 export type { Handler, Store } from "./idempotency.js";
 
 export * as schema from "./schema.js";
-export type { SchemaProvider, SchemaNode } from "./schema.js";
+export { sensitivePaths } from "./schema.js";
+export type { SchemaProvider, SchemaNode, SensitivePath } from "./schema.js";
+
+export * as gdpr from "./gdpr.js";
+export {
+  AesGcmCipher,
+  protect,
+  unprotect,
+  DecryptError,
+  InvalidKeySizeError,
+  MalformedCiphertextError,
+} from "./gdpr.js";
+export type { Cipher } from "./gdpr.js";
 
 export { redrive, resetForRedrive } from "./redrive.js";
 export type {

@@ -110,6 +110,74 @@ export function wrap(provider: SchemaProvider, handler: SchemaHandler): SchemaHa
   };
 }
 
+/**
+ * One property marked `x-gdpr-sensitive`, located by its dotted path from the schema root.
+ * Array element schemas contribute a `field[]` segment (matching the Go `SensitivePath` and the
+ * registry's path convention). `category` is the optional `"x-gdpr-sensitive": "<category>"`
+ * string (e.g. `"email"`), or `""` when the mark was the boolean `true`.
+ */
+export interface SensitivePath {
+  /** Dotted path from the schema root, e.g. `"email"`, `"profile.full_name"`, `"addresses[].line"`. A mark on the root schema itself is the empty string `""`. */
+  path: string;
+  /** Free-form category, or `""` when the keyword was the boolean `true`. */
+  category: string;
+}
+
+/**
+ * Whether a schema node carries the `x-gdpr-sensitive` mark (ADR-0030), with its optional
+ * category. Accepts either the boolean `true` or a non-empty string category (the
+ * documentation form, e.g. `"email"`); any other shape — `false`, `""`, a number — is unmarked.
+ * The keyword is **validation-neutral**: {@link validateSchema} never reads it, so annotating a
+ * schema can never change a verdict (adding the mark is non-breaking, GR-1). Mirrors the Go
+ * `fromMap` parse and the registry's parser.
+ */
+function gdprMark(schema: SchemaNode): { marked: boolean; category: string } {
+  const raw = schema["x-gdpr-sensitive"];
+  if (raw === true) {
+    return { marked: true, category: "" };
+  }
+  if (typeof raw === "string" && raw !== "") {
+    return { marked: true, category: raw };
+  }
+  return { marked: false, category: "" };
+}
+
+/**
+ * Every property a schema marks `x-gdpr-sensitive`, in sorted path order (ADR-0030). It descends
+ * nested objects (dotted paths) and array item schemas (a `field[]` segment), and reports a mark
+ * on the root schema itself as the path `""`. This is the value-level counterpart to the
+ * registry's inventory: {@link protect}/{@link unprotect} use these paths to locate the leaves to
+ * encrypt on produce and decrypt on consume. It is the Node mirror of the Go
+ * `Schema.SensitivePaths()`.
+ */
+export function sensitivePaths(schema: SchemaNode): SensitivePath[] {
+  const out: SensitivePath[] = [];
+  collectSensitive(schema, "", out);
+  out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return out;
+}
+
+function collectSensitive(schema: SchemaNode, path: string, out: SensitivePath[]): void {
+  const mark = gdprMark(schema);
+  if (mark.marked) {
+    out.push({ path, category: mark.category });
+  }
+
+  const properties = schema.properties;
+  if (typeof properties === "object" && properties !== null && !Array.isArray(properties)) {
+    for (const [name, sub] of Object.entries(properties as Record<string, unknown>)) {
+      if (typeof sub === "object" && sub !== null && !Array.isArray(sub)) {
+        collectSensitive(sub as SchemaNode, join(path, name), out);
+      }
+    }
+  }
+
+  const items = schema.items;
+  if (typeof items === "object" && items !== null && !Array.isArray(items)) {
+    collectSensitive(items as SchemaNode, `${path}[]`, out);
+  }
+}
+
 /** The first violation of `value` against a (subset) JSON Schema node, or null. */
 export function validateSchema(schema: SchemaNode, value: unknown, path = ""): string | null {
   if ("const" in schema && !equal(value, schema.const)) {

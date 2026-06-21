@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/core",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Polyglot Queues, Simplified — the Node/TypeScript core: the canonical BabelQueue wire-envelope codec, contracts and dead-letter helpers.",
   "keywords": [
     "queue",
@@ -59,7 +59,7 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src test",
-    "test": "node --import tsx --test test/codec.test.ts test/dead-letter.test.ts test/conformance.test.ts test/overhead.test.ts test/idempotency.test.ts test/schema.test.ts test/otel.test.ts test/redrive.test.ts test/replay.test.ts test/outbox.test.ts",
+    "test": "node --import tsx --test test/codec.test.ts test/dead-letter.test.ts test/conformance.test.ts test/overhead.test.ts test/idempotency.test.ts test/schema.test.ts test/otel.test.ts test/redrive.test.ts test/replay.test.ts test/outbox.test.ts test/gdpr.test.ts",
     "coverage": "c8 --check-coverage --lines 90 --functions 90 --branches 85 --reporter=text npm test",
     "prepublishOnly": "npm run build"
   },

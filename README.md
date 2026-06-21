@@ -165,6 +165,52 @@ Implement `OutboxStore` over your DB (`save`, `fetchUnpublished` oldest-first �
 adapter SHOULD claim/lock rows so two relays don't double-publish — `markPublished`,
 `markFailed`) and `OutboxTransport` (`publish(body, queue)`) over your broker.
 
+### GDPR field encryption (optional)
+
+A schema can mark a `data` field `x-gdpr-sensitive` (ADR-0030). `gdpr.protect` encrypts
+each marked leaf **in place** before publish, and `gdpr.unprotect` restores it after
+decode — so PII rides the wire as ciphertext while the envelope stays frozen.
+
+```ts
+import { EnvelopeCodec, gdpr, schema } from "@babelqueue/core";
+
+// Your key, your cipher — bind a KMS/Vault/HSM here, or use the bundled AES-256-GCM one.
+const cipher = new gdpr.AesGcmCipher(myKey); // 16/24/32-byte key
+
+// PRODUCER — validate CLEARTEXT, then encrypt the marked leaves.
+const env = EnvelopeCodec.make("urn:babel:people:created", person, { queue: "people" });
+const s = provider.schemaFor(env.job);
+if (s) {
+  await schema.validate(provider, env.job, env.data); // cleartext, before protect
+  gdpr.protect(env.data, s, cipher);                   // email/full_name/... → ciphertext
+}
+const body = EnvelopeCodec.encode(env);                // ciphertext rides inside data
+
+// CONSUMER — decrypt the marked leaves, then validate CLEARTEXT.
+const incoming = EnvelopeCodec.decode(body);
+const cs = provider.schemaFor(incoming.job!);
+if (cs) {
+  gdpr.unprotect(incoming.data as Record<string, unknown>, cs, cipher);
+  await schema.validate(provider, incoming.job!, incoming.data as Record<string, unknown>);
+}
+```
+
+`protect` canonically JSON-encodes each marked value then replaces it with the cipher's
+**ciphertext string**, so the round-trip is byte-for-byte exact (numbers come back as
+numbers, objects as objects). It walks **nested objects** (`profile.full_name`) and
+**array items** (`addresses[].line`); an absent marked field is skipped; a non-sensitive
+field is never touched. Validate **cleartext** — before `protect`, after `unprotect` —
+because a schema constraining a sensitive field would reject the ciphertext string.
+
+The `Cipher` is an **interface you bind** (`encrypt(bytes) → string` /
+`decrypt(string) → bytes`, both synchronous) so the core pulls **no crypto dependency**
+(GR-7). The bundled `AesGcmCipher` is built only on `node:crypto` (AES-256-GCM, random IV
+prepended, base64; GCM auth-tag verified so a wrong key or tampered ciphertext **throws**
+`DecryptError`). The envelope stays **frozen** (GR-1): only `data` *values* change, a
+ciphertext is a JSON string so `data` stays pure JSON (GR-3), `meta.schema_version` stays
+**1** and `trace_id` is preserved (GR-4) — an SDK without the key still carries the
+envelope, it just can't read the protected fields. Entirely opt-in.
+
 ## What this core is (and isn't)
 
 It enforces the **contract**: the envelope shape, URN identity, trace propagation,

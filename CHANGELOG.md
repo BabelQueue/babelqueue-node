@@ -9,6 +9,43 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-21
+
+### Added
+- **Runtime GDPR field encryption — the SDK-enforcement half of `x-gdpr-sensitive`
+  (ADR-0030).** The registry only *declares* and *audits* which `data` fields are
+  personal/sensitive; this core now *enforces* it on the wire. A producer encrypts each
+  marked leaf before publish, a consumer decrypts it after decode — PII rides the wire as
+  ciphertext while the envelope stays frozen. The Node mirror of the Go reference; purely
+  additive, opt-in and validation-neutral.
+  - New `gdpr.protect(data, schema, cipher)` / `gdpr.unprotect(...)` standalone helpers —
+    they rewrite each `x-gdpr-sensitive` leaf **in place**: `protect` canonically
+    JSON-encodes the value then replaces it with the cipher's **ciphertext string**;
+    `unprotect` is the byte-for-byte inverse (numbers restore to numbers, objects to
+    objects). They walk **nested objects** (`profile.full_name`) and **array items**
+    (`addresses[].line`); an absent marked field is skipped (not an error); a non-sensitive
+    field is never touched. A wrong-key / tampered / non-ciphertext value throws the typed
+    `DecryptError` so the consumer fails the message (retry / dead-letter).
+  - New `Cipher` interface — `encrypt(bytes): string` / `decrypt(string): bytes`, both
+    **synchronous** — the caller-provided seam onto a KMS / Vault / HSM / tokenisation
+    service, so the core pulls **no** crypto dependency (GR-7).
+  - New `AesGcmCipher` reference cipher built **only** on `node:crypto` — AES-GCM with a
+    random 12-byte IV prepended and base64 output (`base64(iv || ciphertext || tag)`);
+    16/24/32-byte keys select AES-128/192/256-GCM. The caller owns the key (no key
+    management). GCM authenticates, so a wrong key or tampered input throws rather than
+    returning corrupt plaintext. New typed errors `DecryptError`, `InvalidKeySizeError`,
+    `MalformedCiphertextError`.
+  - New `schema.sensitivePaths(schema)` + `SensitivePath` type — parses the
+    `x-gdpr-sensitive` keyword (boolean `true` or non-empty string category) and walks
+    nested objects, array items and the root mark, in sorted path order. Parsing is
+    **validation-neutral** — the keyword never makes a value valid or invalid, so annotating
+    a schema is non-breaking.
+  - The envelope stays **frozen** (GR-1): only `data` *values* change, a ciphertext is a
+    JSON string so `data` stays pure JSON (GR-3), `meta.schema_version` stays **1** and
+    `trace_id` is preserved (GR-4). An SDK without the key still carries the envelope.
+    Validate **cleartext** — before `protect`, after `unprotect`. Entirely opt-in and
+    backward compatible.
+
 ## [1.6.0] - 2026-06-21
 
 ### Added
