@@ -9,6 +9,36 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-21
+
+### Added
+- **Transactional outbox — an optional producer-side helper that removes the dual
+  write (ADR-0029).** A plain producer must commit its business row **and** publish to
+  the broker — two systems that disagree on a crash. The outbox persists the encoded
+  envelope into the **same DB transaction** as the business write, and a separate relay
+  publishes the durable rows afterwards: no distributed transaction, exactly-once
+  *handoff*, then at-least-once on the wire as always.
+  - New `Outbox` writer — `write(envelope)` encodes via the frozen `EnvelopeCodec` and
+    delegates to the store. **The caller owns the transaction boundary**; the helper
+    never begins/commits anything (GR-7).
+  - New `OutboxStore` interface (`save`, `fetchUnpublished` oldest-first, `markPublished`,
+    `markFailed`) — the persistence seam the caller binds to their own DB; the core ships
+    no DB driver. New `OutboxTransport` interface (`publish(body, queue)`) — the
+    publish-only seam the relay forwards through, bound to the caller's broker.
+  - New `OutboxRelay` — `flush()` publishes one batch (marking each row published only
+    **after** the transport resolves; a rejecting publish → `markFailed` + bounded linear
+    backoff, the row stays pending, the batch continues) and `drain(maxPasses?)` loops
+    until no progress, with a safety ceiling. The sleeper is injectable so tests are
+    instant.
+  - New `InMemoryOutboxStore` reference store (tests / single-process demos; no real
+    transaction). New types `OutboxRecord`, `OutboxRelayResult`, `OutboxRelayOptions`,
+    `Sleeper`.
+  - The relay publishes the **stored bytes verbatim** — never decoding, rebuilding or
+    re-encoding the envelope — so `trace_id` is preserved end-to-end (GR-4) and the body
+    is byte-identical before store and after relay (GR-1/GR-5). `schema_version` stays
+    **1**: the outbox's bookkeeping lives *around* the envelope, never *on* the wire.
+    Entirely opt-in and backward compatible.
+
 ## [1.5.0] - 2026-06-21
 
 ### Added

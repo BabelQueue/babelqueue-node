@@ -49,3 +49,13 @@ export type {
 } from "./redrive.js";
 
 export { HEADER_REPLAY_BYPASS, isReplay, bypassExternalEffects } from "./replay.js";
+
+export { Outbox, OutboxRelay, InMemoryOutboxStore } from "./outbox.js";
+export type {
+  OutboxStore,
+  OutboxTransport,
+  OutboxRecord,
+  OutboxRelayResult,
+  OutboxRelayOptions,
+  Sleeper,
+} from "./outbox.js";

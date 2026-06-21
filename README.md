@@ -129,6 +129,42 @@ stays **1**, GR-1) — the same out-of-band `HeaderCarrier` seam as the `tracepa
 header. It takes effect only when the `RedriveIO` implements `publishWithHeaders`;
 otherwise `bypass` is a no-op (`bypassed: false`) and the message is still redriven.
 
+### Transactional outbox (optional)
+
+A plain producer does two things that must both happen or neither — commit the
+business row and publish the message — across two systems that can disagree on a
+crash (the **dual write**). The outbox removes it: `outbox.write(env)` persists the
+**encoded envelope into the same DB transaction** as your business write, and a
+separate `OutboxRelay` publishes the durable rows afterwards (ADR-0029).
+
+```ts
+import { Outbox, OutboxRelay, InMemoryOutboxStore, EnvelopeCodec } from "@babelqueue/core";
+
+// 1) WRITE — the caller owns the transaction boundary (this is the whole point).
+const outbox = new Outbox(store); // your OutboxStore, bound to your DB
+await db.transaction(async (tx) => {
+  await tx.insertOrder(order);                          // the business write
+  const env = EnvelopeCodec.make("urn:babel:orders:created", { order_id }, { queue: "orders" });
+  await outbox.write(env);                              // same connection, same tx
+});                                                     // both commit, or neither
+
+// 2) RELAY — drain the durable rows onto the broker (a worker loop / cron).
+const relay = new OutboxRelay(transport, store);       // your OutboxTransport
+await relay.drain();                                   // publishes verbatim, marks published
+```
+
+The store and the transport are **interfaces you bind** to your own DB and broker —
+the core ships no DB driver (GR-7) and only an `InMemoryOutboxStore` reference for
+tests/demos. The relay publishes the **stored bytes verbatim** — it never decodes,
+rebuilds or re-encodes the envelope — so `trace_id` is preserved end-to-end (GR-4)
+and the body is byte-identical before store and after relay (GR-1/GR-5). It is
+**at-least-once handoff**: a crash between publish and mark-published re-publishes the
+row, so consumers must stay idempotent (the `Wrap` helper is the consumer-side mirror).
+
+Implement `OutboxStore` over your DB (`save`, `fetchUnpublished` oldest-first — your
+adapter SHOULD claim/lock rows so two relays don't double-publish — `markPublished`,
+`markFailed`) and `OutboxTransport` (`publish(body, queue)`) over your broker.
+
 ## What this core is (and isn't)
 
 It enforces the **contract**: the envelope shape, URN identity, trace propagation,
