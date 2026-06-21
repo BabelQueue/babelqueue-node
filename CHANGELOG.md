@@ -9,7 +9,26 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-21
+
 ### Added
+- **Replay-bypass — an out-of-band side-effect guard for DLQ replay (ADR-0027).** A
+  deliberate `redrive` re-runs the handler and re-fires its external side-effects (a second
+  charge, a duplicate email); idempotency stops an *accidental* duplicate, not the *intended*
+  reprocess. This closes that gap.
+  - New `redrive(io, dlq, { bypass: true })` option stamps a `bq-replay-bypass` **transport
+    header** on each replayed message; the per-item result gains a `bypassed` flag. It takes
+    effect only when the `RedriveIO` implements the new optional `publishWithHeaders(queue,
+    body, headers)` capability — otherwise `bypass` is a no-op and the message is still
+    redriven (`bypassed: false`), exactly like the Go reference.
+  - New `isReplay(headers)` + `bypassExternalEffects(headers, effect)` consume-side guard
+    (plus the `HEADER_REPLAY_BYPASS` constant): a handler wraps its external, non-idempotent
+    side so a replay skips it while the idempotent core still runs.
+  - The marker rides **beside** the frozen envelope on the `HeaderCarrier` seam, never inside
+    it (`schema_version` stays **1**, GR-1; `trace_id` preserved, GR-4) — the same out-of-band
+    channel as the `traceparent` header. Fully opt-in and backward compatible: a header-less
+    message behaves exactly as before. Per-adapter transport wiring (the
+    `babelqueue-node-adapters` repo) is the documented follow-up, like ADR-0028's.
 - **OpenTelemetry v0.2 — W3C `traceparent` cross-hop span linkage (ADR-0028).** The
   `@babelqueue/core/otel` module now propagates the active span as a W3C `traceparent`
   (and `tracestate`) **transport header** so a consumer span is a true **child** of the

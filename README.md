@@ -101,6 +101,34 @@ const dlq = annotate(env, "failed", "orders", { attempts: 3, error: "boom" });
 `annotate` returns a copy — the original envelope is preserved unchanged inside
 the dead-lettered message, so any-language consumers can still read it.
 
+### Replay-bypass (optional)
+
+A deliberate replay off the DLQ ([`redrive`](src/redrive.ts)) re-runs the handler,
+re-firing its external side-effects — a second charge, a duplicate email. With
+`bypass`, `redrive` stamps a `bq-replay-bypass` **transport header** on each replayed
+message; a handler reads the delivered headers and skips the effects that already ran,
+while the idempotent core still runs (ADR-0027).
+
+```ts
+import { redrive, isReplay, bypassExternalEffects } from "@babelqueue/core";
+
+// PRODUCER: redrive with bypass (the IO must carry headers — publishWithHeaders).
+await redrive(io, "orders.dlq", { bypass: true });
+
+// CONSUMER: the adapter surfaces the delivered message's out-of-band headers.
+async function onMessage(env, headers) {
+  saveOrder(env);                                    // idempotent core — always runs
+  await bypassExternalEffects(headers, async () => { // skipped when isReplay(headers)
+    await sendConfirmationEmail(env);
+  });
+}
+```
+
+The marker rides **beside** the frozen envelope, never inside it (`schema_version`
+stays **1**, GR-1) — the same out-of-band `HeaderCarrier` seam as the `traceparent`
+header. It takes effect only when the `RedriveIO` implements `publishWithHeaders`;
+otherwise `bypass` is a no-op (`bypassed: false`) and the message is still redriven.
+
 ## What this core is (and isn't)
 
 It enforces the **contract**: the envelope shape, URN identity, trace propagation,

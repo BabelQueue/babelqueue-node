@@ -47,3 +47,5 @@ export type {
   RedriveOptions,
   RedriveResult,
 } from "./redrive.js";
+
+export { HEADER_REPLAY_BYPASS, isReplay, bypassExternalEffects } from "./replay.js";
