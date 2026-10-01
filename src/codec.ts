@@ -75,6 +75,99 @@ export interface MakeOptions {
   traceId?: string;
 }
 
+/** Options for {@link EnvelopeCodec.decode}. */
+export interface DecodeOptions {
+  /**
+   * Receives one human-readable warning per non-canonical key found on the wire
+   * (message-envelope.md §10). The message always names the key as an RFC 6901
+   * pointer (e.g. `/meta/max_retries`). Called for every occurrence. Defaults to
+   * `process.emitWarning` with the code {@link FORBIDDEN_KEY_WARNING_CODE}, emitted
+   * once per key per process so a high-volume legacy producer cannot flood stderr.
+   */
+  onWarning?: (message: string) => void;
+}
+
+/** Options for {@link EnvelopeCodec.encode}. */
+export interface EncodeOptions {
+  /**
+   * Receives one human-readable warning per non-canonical key the caller put on the
+   * envelope (message-envelope.md §10); the key is left out of the output. Called
+   * for every occurrence. Defaults to `process.emitWarning` with the code
+   * {@link FORBIDDEN_KEY_WARNING_CODE}, emitted once per key per process.
+   */
+  onWarning?: (message: string) => void;
+}
+
+/** The `process.emitWarning` code used for dropped non-canonical keys. */
+export const FORBIDDEN_KEY_WARNING_CODE = "BABELQUEUE_FORBIDDEN_KEY";
+
+/** Non-canonical top-level keys (message-envelope.md §10). */
+const FORBIDDEN_TOP_LEVEL_KEYS = ["timestamp"] as const;
+
+/** Non-canonical `meta` keys (message-envelope.md §10). */
+const FORBIDDEN_META_KEYS = ["max_retries", "attempts", "source", "ts"] as const;
+
+/** Default-channel warnings already emitted in this process (one per key and direction). */
+const emittedWarnings = new Set<string>();
+
+function defaultWarning(message: string): void {
+  if (emittedWarnings.has(message)) return;
+  emittedWarnings.add(message);
+  if (typeof process !== "undefined" && typeof process.emitWarning === "function") {
+    process.emitWarning(message, { code: FORBIDDEN_KEY_WARNING_CODE });
+  }
+}
+
+/**
+ * Remove every non-canonical key from `envelope` in place, reporting each one via
+ * `warn` (when given). Returns the same object for chaining.
+ */
+function stripForbiddenKeys<T extends object>(
+  envelope: T,
+  warn?: (message: string) => void,
+  message: (pointer: string) => string = forbiddenKeyMessage,
+): T {
+  const record = envelope as Record<string, unknown>;
+  for (const key of FORBIDDEN_TOP_LEVEL_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(record, key)) {
+      delete record[key];
+      warn?.(message(`/${key}`));
+    }
+  }
+  const meta = record.meta;
+  if (meta !== null && typeof meta === "object" && !Array.isArray(meta)) {
+    const metaRecord = meta as Record<string, unknown>;
+    for (const key of FORBIDDEN_META_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(metaRecord, key)) {
+        delete metaRecord[key];
+        warn?.(message(`/meta/${key}`));
+      }
+    }
+  }
+  return envelope;
+}
+
+function hasForbiddenKeys(envelope: object): boolean {
+  const record = envelope as Record<string, unknown>;
+  if (FORBIDDEN_TOP_LEVEL_KEYS.some((k) => Object.prototype.hasOwnProperty.call(record, k))) {
+    return true;
+  }
+  const meta = record.meta;
+  return (
+    meta !== null &&
+    typeof meta === "object" &&
+    FORBIDDEN_META_KEYS.some((k) => Object.prototype.hasOwnProperty.call(meta, k))
+  );
+}
+
+function forbiddenKeyMessage(pointer: string): string {
+  return `BabelQueue: dropped non-canonical envelope key ${pointer} (message-envelope.md §10); it is never re-emitted.`;
+}
+
+function forbiddenEncodeKeyMessage(pointer: string): string {
+  return `BabelQueue: not encoding non-canonical envelope key ${pointer} (message-envelope.md §10); remove it from the envelope.`;
+}
+
 /**
  * Builds, encodes and decodes the canonical envelope — the single Node/TypeScript
  * implementation of the wire format.
@@ -140,18 +233,28 @@ export const EnvelopeCodec = {
   /**
    * Encode the envelope as compact UTF-8 JSON. `JSON.stringify` already emits the
    * canonical form — no spaces, and slashes/unicode/HTML left unescaped — matching
-   * the other SDK cores.
+   * the other SDK cores. Non-canonical keys (message-envelope.md §10) are never
+   * emitted: if the caller put one on the envelope it is left out of the output and
+   * a warning names it (the caller's object is not modified).
    */
-  encode(envelope: Envelope): string {
+  encode(envelope: Envelope, options: EncodeOptions = {}): string {
+    if (hasForbiddenKeys(envelope)) {
+      const copy = { ...envelope, meta: { ...envelope.meta } };
+      const warn = options?.onWarning ?? defaultWarning;
+      return JSON.stringify(stripForbiddenKeys(copy, warn, forbiddenEncodeKeyMessage));
+    }
     return JSON.stringify(envelope);
   },
 
   /**
    * Parse a raw JSON body. Returns `{}` for malformed or non-object input (call
    * {@link EnvelopeCodec.accepts} before trusting it). Resolves the `urn` inbound
-   * alias into `job`.
+   * alias into `job`. Unknown keys are kept (forward compatibility); the
+   * non-canonical keys of message-envelope.md §10 (`timestamp`, `meta.max_retries`,
+   * `meta.attempts`, `meta.source`, `meta.ts`) are dropped with a warning — decode
+   * still succeeds so older producers keep working.
    */
-  decode(raw: string): IncomingEnvelope {
+  decode(raw: string, options: DecodeOptions = {}): IncomingEnvelope {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -162,7 +265,10 @@ export const EnvelopeCodec = {
       return {};
     }
 
-    const envelope = parsed as IncomingEnvelope;
+    const envelope = stripForbiddenKeys(
+      parsed as IncomingEnvelope,
+      options.onWarning ?? defaultWarning,
+    );
     if (!envelope.job && typeof envelope.urn === "string") {
       envelope.job = envelope.urn;
     }

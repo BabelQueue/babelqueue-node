@@ -199,7 +199,9 @@ export function validateSchema(schema: SchemaNode, value: unknown, path = ""): s
         return violation(path, "not_a_string");
       }
       const minLength = schema.minLength;
-      if (typeof minLength === "number" && value.length < minLength) {
+      // Length is counted in Unicode code points (not UTF-16 code units), so an
+      // astral character such as an emoji counts once — the cross-SDK rule.
+      if (typeof minLength === "number" && codePointLength(value) < minLength) {
         return violation(path, "below_min_length");
       }
       return null;
@@ -259,6 +261,11 @@ function checkObject(schema: SchemaNode, value: unknown, path: string): string |
   }
 
   return null;
+}
+
+/** The number of Unicode code points in `value` (a surrogate pair counts once). */
+function codePointLength(value: string): number {
+  return [...value].length;
 }
 
 function checkArray(schema: SchemaNode, value: unknown, path: string): string | null {

@@ -9,6 +9,34 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-01
+
+### Fixed
+- **`minLength` now counts Unicode code points**, not UTF-16 code units. An astral
+  character (e.g. an emoji) counts once, so `"😀"` no longer satisfies `minLength: 2`.
+  Verdicts now match the other SDK cores (conformance `payload_schema_unicode`).
+- **Non-canonical envelope keys are dropped on decode, with a warning** (message-envelope.md
+  §10, policy K-15): `timestamp`, `meta.max_retries`, `meta.attempts`, `meta.source` and
+  `meta.ts`. Decode still succeeds so older producers keep working; the keys are no longer
+  carried through and re-emitted on retry/relay. `encode` never emits them either: a key the
+  caller set on the envelope object is left out of the output (the object itself is not
+  modified) and a warning names it. All other unknown keys are still preserved.
+  K-15's *reject on encode* is planned for R1-E0, when `encode` will throw instead of
+  dropping, so treat these warnings as errors-to-be.
+- **The default warning channel is rate-limited:** `process.emitWarning` fires once per key
+  (and direction) per process, so a high-volume legacy producer cannot flood stderr. An
+  explicit `onWarning` callback still receives every occurrence.
+
+### Added
+- `EnvelopeCodec.decode(raw, { onWarning })` — an optional `DecodeOptions.onWarning`
+  callback that receives one message per dropped key, naming it as a JSON pointer
+  (e.g. `/meta/max_retries`). Without it the warning goes to `process.emitWarning` with
+  the code `FORBIDDEN_KEY_WARNING_CODE` (`"BABELQUEUE_FORBIDDEN_KEY"`).
+- `EnvelopeCodec.encode(envelope, { onWarning })` — the same optional callback
+  (`EncodeOptions`) for keys left out on encode.
+- Conformance runners for the new shared sections `roundtrip`, `data_shape`,
+  `forbidden_keys` and `payload_schema_unicode`.
+
 ## [1.7.0] - 2026-06-21
 
 ### Added

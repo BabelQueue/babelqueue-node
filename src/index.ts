@@ -14,9 +14,16 @@
  * Full spec: https://babelqueue.com
  */
 
-export { EnvelopeCodec, SCHEMA_VERSION, SOURCE_LANG } from "./codec.js";
+export {
+  EnvelopeCodec,
+  FORBIDDEN_KEY_WARNING_CODE,
+  SCHEMA_VERSION,
+  SOURCE_LANG,
+} from "./codec.js";
 export type {
   DeadLetter,
+  DecodeOptions,
+  EncodeOptions,
   Envelope,
   IncomingEnvelope,
   MakeOptions,

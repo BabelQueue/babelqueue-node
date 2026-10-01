@@ -110,3 +110,24 @@ test("payload conformance: agrees with the shared cross-SDK cases", () => {
     assert.equal(isValid, c.valid, `case ${c.name}`);
   }
 });
+
+test("payload conformance: minLength counts Unicode code points", () => {
+  const suite = new URL("./conformance/", import.meta.url);
+  const manifest = JSON.parse(
+    readFileSync(fileURLToPath(new URL("manifest.json", suite)), "utf8"),
+  ) as {
+    payload_schema_unicode?: {
+      schema: SchemaNode;
+      cases: Array<{ name: string; valid: boolean; data: Record<string, unknown> }>;
+    };
+  };
+  const section = manifest.payload_schema_unicode;
+  if (!section) {
+    throw new Error("manifest has no payload_schema_unicode section");
+  }
+  assert.ok(section.cases.length > 0);
+  for (const c of section.cases) {
+    const isValid: boolean = validateSchema(section.schema, c.data) === null;
+    assert.equal(isValid, c.valid, `case ${c.name}`);
+  }
+});
