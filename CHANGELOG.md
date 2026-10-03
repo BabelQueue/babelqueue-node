@@ -9,7 +9,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-## [1.8.0] - 2026-10-01
+## [1.8.0] - 2026-10-03
 
 ### Fixed
 - **`minLength` now counts Unicode code points**, not UTF-16 code units. An astral
