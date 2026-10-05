@@ -21,7 +21,7 @@
     "url": "git+https://github.com/BabelQueue/babelqueue-node.git"
   },
   "license": "MIT",
-  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "author": "Muhammet Şafak <info@muhammetsafak.com>",
   "type": "module",
   "exports": {
     ".": {
