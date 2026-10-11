@@ -45,6 +45,18 @@ export interface RedriveIO {
    * (ADR-0027).
    */
   publishWithHeaders?(queue: string, body: string, headers: HeaderCarrier): Promise<void>;
+  /**
+   * Optional capability — re-publish a body on behalf of the message `from` that {@link RedriveIO.pop}
+   * reserved, carrying whatever native per-message metadata the broker attaches that the plain
+   * {@link RedriveIO.publish} cannot express — for Kafka, the record key (contract §6.5, "Record key
+   * on republish": a null key stays null, an empty key stays empty). {@link redrive} uses it for
+   * every write it makes from a reserved DLQ message: the redrive write and the restore write back
+   * to the DLQ (skipped, dry-run, undecodable, publish failure). `from` is the exact object `pop`
+   * returned, so a keyed transport can return a {@link RedriveMessage} subtype carrying the key. The
+   * Node counterpart of Go's optional `KeyedRepublisher`. A {@link RedriveIO} that omits it falls
+   * back to plain {@link RedriveIO.publish}, so the metadata is simply not carried.
+   */
+  publishFrom?(queue: string, body: string, from: RedriveMessage): Promise<void>;
 }
 
 /** Options for {@link redrive}. */
@@ -141,7 +153,7 @@ export async function redrive(
 
   for (const { message, envelope } of batch) {
     if (!envelope) {
-      await io.publish(dlq, message.body); // restore the undecodable body; never drop it
+      await republishFrom(io, dlq, message.body, message); // restore the undecodable body; never drop it
       await message.ack();
       result.skipped++;
       result.items.push({ messageId: "", traceId: "", urn: "", reason: "", from: dlq, to: "", redriven: false, bypassed: false });
@@ -160,7 +172,7 @@ export async function redrive(
     };
 
     if (opts.select && !opts.select(envelope)) {
-      await io.publish(dlq, message.body); // not selected: restore unchanged
+      await republishFrom(io, dlq, message.body, message); // not selected: restore unchanged
       await message.ack();
       result.skipped++;
       result.items.push(item);
@@ -171,7 +183,7 @@ export async function redrive(
     item.to = target;
 
     if (opts.dryRun) {
-      await io.publish(dlq, message.body); // report the plan; restore unchanged
+      await republishFrom(io, dlq, message.body, message); // report the plan; restore unchanged
       await message.ack();
       result.skipped++;
       result.items.push(item);
@@ -181,9 +193,9 @@ export async function redrive(
     const body = EnvelopeCodec.encode(resetForRedrive(envelope));
     let bypassed: boolean;
     try {
-      bypassed = await publishRedriven(io, target, body, opts.bypass ?? false);
+      bypassed = await publishRedriven(io, target, body, opts.bypass ?? false, message);
     } catch (err) {
-      await io.publish(dlq, message.body); // restore on a publish failure
+      await republishFrom(io, dlq, message.body, message); // restore on a publish failure
       await message.ack();
       throw err;
     }
@@ -198,15 +210,36 @@ export async function redrive(
 }
 
 /**
- * Re-publishes a reset `body` to `queue`. When `bypass` is set and the {@link RedriveIO} can carry
- * headers ({@link RedriveIO.publishWithHeaders}), it stamps the `bq-replay-bypass` header and
- * reports `true`; otherwise it publishes plainly and reports `false` (ADR-0027).
+ * Re-publishes a reset `body` to `queue` on behalf of the DLQ message `from`. When `bypass` is set
+ * and the {@link RedriveIO} can carry headers ({@link RedriveIO.publishWithHeaders}), it stamps the
+ * `bq-replay-bypass` header and reports `true` (that path carries no record key, like the Go
+ * reference); otherwise it re-publishes through {@link republishFrom} and reports `false` (ADR-0027).
  */
-async function publishRedriven(io: RedriveIO, queue: string, body: string, bypass: boolean): Promise<boolean> {
+async function publishRedriven(
+  io: RedriveIO,
+  queue: string,
+  body: string,
+  bypass: boolean,
+  from: RedriveMessage,
+): Promise<boolean> {
   if (bypass && io.publishWithHeaders) {
     await io.publishWithHeaders(queue, body, { [HEADER_REPLAY_BYPASS]: "1" });
     return true;
   }
-  await io.publish(queue, body);
+  await republishFrom(io, queue, body, from);
   return false;
+}
+
+/**
+ * Re-publishes `body` to `queue` on behalf of the reserved message `from`. A {@link RedriveIO}
+ * implementing {@link RedriveIO.publishFrom} (Kafka: the record key, contract §6.5) takes over the
+ * whole re-publish so the DLQ record's key is carried byte-for-byte; otherwise it is a plain
+ * {@link RedriveIO.publish}. Used for both the redrive write and the restore write back to the DLQ.
+ */
+async function republishFrom(io: RedriveIO, queue: string, body: string, from: RedriveMessage): Promise<void> {
+  if (io.publishFrom) {
+    await io.publishFrom(queue, body, from);
+    return;
+  }
+  await io.publish(queue, body);
 }

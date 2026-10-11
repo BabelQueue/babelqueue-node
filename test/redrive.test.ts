@@ -157,3 +157,105 @@ test("an undecodable body is restored, not lost", async () => {
   assert.equal(io.queue("dlq").length, 1);
   assert.equal(io.queue("dlq")[0], "not-json{{{");
 });
+
+// --- Record key preservation (contract §6.5 "Record key on republish") ---------
+
+type KeyedMessage = RedriveMessage & { key: Buffer | null };
+interface KeyedRecord {
+  body: string;
+  key: Buffer | null;
+}
+
+// keyedIO is an in-memory RedriveIO with the optional publishFrom capability: a reserved message
+// carries a key, and publishFrom re-publishes that key (null stays null, empty stays empty).
+function keyedIO(): RedriveIO & { records(name: string): KeyedRecord[] } {
+  const queues = new Map<string, KeyedRecord[]>();
+  const q = (name: string): KeyedRecord[] => {
+    let arr = queues.get(name);
+    if (!arr) {
+      arr = [];
+      queues.set(name, arr);
+    }
+    return arr;
+  };
+  return {
+    records: q,
+    async pop(queue: string): Promise<KeyedMessage | null> {
+      const rec = q(queue).shift();
+      if (!rec) {
+        return null;
+      }
+      return { body: rec.body, key: rec.key, async ack(): Promise<void> {} };
+    },
+    async publish(queue: string, body: string): Promise<void> {
+      q(queue).push({ body, key: null });
+    },
+    async publishFrom(queue: string, body: string, from: RedriveMessage): Promise<void> {
+      const key = (from as KeyedMessage).key;
+      q(queue).push({ body, key: key === null || key === undefined ? null : Buffer.from(key) });
+    },
+  };
+}
+
+test("redrive carries the DLQ record key byte-for-byte: keyed, empty and null", async () => {
+  const io = keyedIO();
+  io.records("orders.dlq").push(
+    { body: deadLetteredBody("urn:babel:orders:created", "orders", { n: 1 }), key: Buffer.from("tenant-7") },
+    { body: deadLetteredBody("urn:babel:orders:created", "orders", { n: 2 }), key: Buffer.alloc(0) },
+    { body: deadLetteredBody("urn:babel:orders:created", "orders", { n: 3 }), key: null },
+  );
+
+  const res = await redrive(io, "orders.dlq");
+  assert.equal(res.redriven, 3);
+
+  const out = io.records("orders");
+  assert.equal(out.length, 3);
+  assert.deepEqual(out[0]!.key, Buffer.from("tenant-7"));
+  assert.ok(out[1]!.key !== null && out[1]!.key.length === 0, "empty key stays empty");
+  assert.equal(out[2]!.key, null, "null key stays null");
+});
+
+test("redrive restore writes (dry run, unselected, undecodable) keep the key", async () => {
+  const io = keyedIO();
+  const key = Buffer.from([0x00, 0xff, 0x10]);
+  io.records("orders.dlq").push(
+    { body: deadLetteredBody("urn:babel:orders:created", "orders"), key },
+    { body: "not-json", key: Buffer.alloc(0) },
+  );
+
+  const res = await redrive(io, "orders.dlq", { dryRun: true });
+  assert.equal(res.skipped, 2);
+  assert.equal(io.records("orders").length, 0);
+
+  const back = io.records("orders.dlq");
+  assert.equal(back.length, 2);
+  assert.deepEqual(back[0]!.key, key);
+  assert.ok(back[1]!.key !== null && back[1]!.key.length === 0);
+});
+
+test("a publish failure restores the DLQ message with its key", async () => {
+  const io = keyedIO();
+  const key = Buffer.from("k1");
+  io.records("orders.dlq").push({ body: deadLetteredBody("urn:babel:orders:created", "orders"), key });
+  const original = io.publishFrom!.bind(io);
+  io.publishFrom = async (queue, body, from) => {
+    if (queue === "orders") {
+      throw new Error("refused");
+    }
+    return original(queue, body, from);
+  };
+
+  await assert.rejects(() => redrive(io, "orders.dlq"), /refused/);
+  const back = io.records("orders.dlq");
+  assert.equal(back.length, 1);
+  assert.deepEqual(back[0]!.key, key);
+});
+
+test("a RedriveIO without publishFrom behaves exactly as before (plain publish)", async () => {
+  const io = memoryIO();
+  assert.equal(io.publishFrom, undefined);
+  io.queue("orders.dlq").push(deadLetteredBody("urn:babel:orders:created", "orders", { order_id: 1 }));
+  const res = await redrive(io, "orders.dlq");
+  assert.equal(res.redriven, 1);
+  assert.equal(io.queue("orders").length, 1);
+});
