@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-10-11
+
 ### Added
 - **DLQ redrive carries the Kafka record key.** `RedriveIO` gains an optional `publishFrom(queue, body, from)`
   capability (the Node counterpart of Go's `KeyedRepublisher`); `redrive` uses it for the redrive write and
