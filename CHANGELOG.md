@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- `RedriveIO.rewind?(from)` — optional capability (the Node counterpart of Go's `Rewinder`). Whatever stops a
+  `redrive()` run (the restore write back to the DLQ failed, the redrive write failed, the `select`
+  predicate threw, the ack failed) the IO is asked to hand back every reserved, unacknowledged message (an
+  offset-committing broker such as Kafka seeks the consumer back, so a later cumulative commit cannot skip
+  any of them; the whole batch is reserved first). A message whose restore failed is never acked. `from`
+  may already be acknowledged (restored after a failed redrive write) and must then not be redelivered.
+  When several steps failed (publish, restore, rewind) all errors are thrown together as one flat
+  `AggregateError`; a lone error is thrown as is. A `RedriveIO` without `rewind` is unchanged, including
+  the error thrown when a redrive write and its restore both fail (the restore error, as before).
+  Additive, no wire change.
+
 ## [1.9.0] - 2026-10-11
 
 ### Added

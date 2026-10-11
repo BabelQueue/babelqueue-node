@@ -259,3 +259,213 @@ test("a RedriveIO without publishFrom behaves exactly as before (plain publish)"
   assert.equal(res.redriven, 1);
   assert.equal(io.queue("orders").length, 1);
 });
+
+// rewindingIO is a RedriveIO whose writes to `failQueue` are refused and which records every ack and
+// every rewind, with an optional failing rewind.
+function rewindingIO(failQueue: string | null, rewindError?: Error): RedriveIO & {
+  pending: string[];
+  acked: string[];
+  rewound: string[];
+} {
+  const io: RedriveIO & { pending: string[]; acked: string[]; rewound: string[] } = {
+    pending: [],
+    acked: [],
+    rewound: [],
+    async pop(): Promise<RedriveMessage | null> {
+      const body = io.pending.shift();
+      if (body === undefined) {
+        return null;
+      }
+      return {
+        body,
+        async ack(): Promise<void> {
+          io.acked.push(body);
+        },
+      };
+    },
+    async publish(queue: string): Promise<void> {
+      if (failQueue === null || queue === failQueue) {
+        throw new Error(`write to ${queue} refused`);
+      }
+    },
+    async rewind(from: RedriveMessage): Promise<void> {
+      io.rewound.push(from.body);
+      if (rewindError) {
+        throw rewindError;
+      }
+    },
+  };
+  return io;
+}
+
+test("a failed restore of an undecodable body rewinds and never acks", async () => {
+  const io = rewindingIO("orders.dlq");
+  io.pending.push("not an envelope");
+  await assert.rejects(redrive(io, "orders.dlq"), /write to orders\.dlq refused/);
+  assert.deepEqual(io.rewound, ["not an envelope"]);
+  assert.deepEqual(io.acked, []);
+});
+
+test("a failed restore of an unselected message rewinds and never acks", async () => {
+  const io = rewindingIO("orders.dlq");
+  const body = deadLetteredBody("urn:babel:orders:created", "orders");
+  io.pending.push(body);
+  await assert.rejects(redrive(io, "orders.dlq", { select: () => false }), /write to orders\.dlq refused/);
+  assert.deepEqual(io.rewound, [body]);
+  assert.deepEqual(io.acked, []);
+});
+
+test("a failed restore of a dry-run message rewinds and never acks", async () => {
+  const io = rewindingIO("orders.dlq");
+  const body = deadLetteredBody("urn:babel:orders:created", "orders");
+  io.pending.push(body);
+  await assert.rejects(redrive(io, "orders.dlq", { dryRun: true }), /write to orders\.dlq refused/);
+  assert.deepEqual(io.rewound, [body]);
+  assert.deepEqual(io.acked, []);
+});
+
+test("a failed redrive write followed by a failed restore rewinds and reports both errors", async () => {
+  const io = rewindingIO(null); // every write is refused, the work queue and the DLQ alike
+  const body = deadLetteredBody("urn:babel:orders:created", "orders");
+  io.pending.push(body);
+  await assert.rejects(redrive(io, "orders.dlq"), (err: unknown) => {
+    assert.ok(err instanceof AggregateError);
+    assert.deepEqual(
+      err.errors.map((e: Error) => e.message),
+      ["write to orders refused", "write to orders.dlq refused"],
+    );
+    return true;
+  });
+  assert.deepEqual(io.rewound, [body]);
+  assert.deepEqual(io.acked, []);
+});
+
+test("a failed rewind is reported together with the restore error, still without an ack", async () => {
+  const seekFailure = new Error("seek failed");
+  const io = rewindingIO("orders.dlq", seekFailure);
+  io.pending.push("not an envelope");
+  await assert.rejects(redrive(io, "orders.dlq"), (err: unknown) => {
+    assert.ok(err instanceof AggregateError);
+    assert.equal(err.errors.length, 2);
+    assert.equal(err.errors[0].message, "write to orders.dlq refused");
+    assert.equal(err.errors[1], seekFailure);
+    return true;
+  });
+  assert.deepEqual(io.acked, []);
+});
+
+test("a failed publish, restore and rewind are reported as one flat list", async () => {
+  const seekFailure = new Error("seek failed");
+  const io = rewindingIO(null, seekFailure);
+  io.pending.push(deadLetteredBody("urn:babel:orders:created", "orders"));
+  await assert.rejects(redrive(io, "orders.dlq"), (err: unknown) => {
+    assert.ok(err instanceof AggregateError);
+    assert.deepEqual(
+      err.errors.map((e: Error) => e.message),
+      ["write to orders refused", "write to orders.dlq refused", "seek failed"],
+    );
+    return true;
+  });
+  assert.deepEqual(io.acked, []);
+});
+
+test("a fully successful run never rewinds", async () => {
+  const io = rewindingIO("never-written");
+  io.pending.push("not an envelope");
+  io.pending.push(deadLetteredBody("urn:babel:orders:created", "orders"));
+  const res = await redrive(io, "orders.dlq");
+  assert.equal(res.redriven, 1);
+  assert.deepEqual(io.rewound, [], "every write succeeded, so nothing is rewound");
+});
+
+test("a failed redrive write with a successful restore still rewinds the rest of the batch", async () => {
+  const io = rewindingIO("orders"); // the work queue refuses, the DLQ restore succeeds
+  const first = deadLetteredBody("urn:babel:orders:created", "orders", { order_id: 1 });
+  const second = deadLetteredBody("urn:babel:orders:created", "orders", { order_id: 2 });
+  io.pending.push(first, second);
+  await assert.rejects(redrive(io, "orders.dlq"), (err: unknown) => {
+    assert.ok(err instanceof Error);
+    assert.equal(err.message, "write to orders refused");
+    assert.ok(!(err instanceof AggregateError), "a lone publish error is thrown as is");
+    return true;
+  });
+  // The first message was restored and acknowledged; the run stopped, so the rewind hands back the rest. The
+  // IO is told which message was the acknowledged one so it can leave that one alone.
+  assert.deepEqual(io.acked, [first]);
+  assert.deepEqual(io.rewound, [first]);
+  assert.deepEqual(io.pending, [], "redrive reserved the whole batch up front, the second message included");
+});
+
+test("a failed rewind after a successful restore is reported together with the publish error", async () => {
+  const seekFailure = new Error("seek failed");
+  const io = rewindingIO("orders", seekFailure);
+  const first = deadLetteredBody("urn:babel:orders:created", "orders");
+  io.pending.push(first);
+  await assert.rejects(redrive(io, "orders.dlq"), (err: unknown) => {
+    assert.ok(err instanceof AggregateError);
+    assert.deepEqual(
+      err.errors.map((e: Error) => e.message),
+      ["write to orders refused", "seek failed"],
+    );
+    return true;
+  });
+  assert.deepEqual(io.acked, [first], "the restored message was acknowledged");
+});
+
+test("a RedriveIO without rewind keeps leaving a failed restore unacknowledged", async () => {
+  const io = rewindingIO("orders.dlq");
+  delete (io as { rewind?: unknown }).rewind;
+  io.pending.push("not an envelope");
+  await assert.rejects(redrive(io, "orders.dlq"), /write to orders\.dlq refused/);
+  assert.deepEqual(io.acked, []);
+});
+
+test("a RedriveIO without rewind rethrows the restore error as is after a failed publish and restore", async () => {
+  const io = rewindingIO(null); // the work queue and the DLQ both refuse
+  delete (io as { rewind?: unknown }).rewind;
+  io.pending.push(deadLetteredBody("urn:babel:orders:created", "orders"));
+  await assert.rejects(redrive(io, "orders.dlq"), (err: unknown) => {
+    assert.ok(err instanceof Error);
+    assert.ok(!(err instanceof AggregateError), "the restore error keeps its type");
+    assert.equal(err.message, "write to orders.dlq refused");
+    return true;
+  });
+  assert.deepEqual(io.acked, []);
+});
+
+test("a throwing select predicate rewinds the message and the rest of the batch", async () => {
+  const io = rewindingIO("never-written");
+  const first = deadLetteredBody("urn:babel:orders:created", "orders", { order_id: 1 });
+  const second = deadLetteredBody("urn:babel:orders:created", "orders", { order_id: 2 });
+  io.pending.push(first, second);
+  const boom = new Error("select exploded");
+  await assert.rejects(
+    redrive(io, "orders.dlq", {
+      select: () => {
+        throw boom;
+      },
+    }),
+    (err: unknown) => err === boom,
+  );
+  assert.deepEqual(io.rewound, [first], "rewound from the message that stopped the run");
+  assert.deepEqual(io.acked, []);
+});
+
+test("a failed ack rewinds the message", async () => {
+  const io = rewindingIO("never-written");
+  const body = deadLetteredBody("urn:babel:orders:created", "orders");
+  io.pending.push(body);
+  const ackFailure = new Error("commit timed out");
+  const pop = io.pop.bind(io);
+  io.pop = async (dlq: string) => {
+    const message = await pop(dlq);
+    return message && {
+      ...message,
+      async ack(): Promise<void> {
+        throw ackFailure;
+      },
+    };
+  };
+  await assert.rejects(redrive(io, "orders.dlq"), (err: unknown) => err === ackFailure);
+  assert.deepEqual(io.rewound, [body]);
+});

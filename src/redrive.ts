@@ -57,6 +57,22 @@ export interface RedriveIO {
    * back to plain {@link RedriveIO.publish}, so the metadata is simply not carried.
    */
   publishFrom?(queue: string, body: string, from: RedriveMessage): Promise<void>;
+  /**
+   * Optional capability — hand a reserved message `from` back to the broker so it is redelivered, and
+   * make sure nothing acknowledged afterwards can move past it. {@link redrive} calls it once, when
+   * an exception stops the run: the message could not be restored to the DLQ (the restore write
+   * itself failed), a redrive publish failed, the `select` predicate threw, or an `ack` failed. In
+   * the first case the message is never acknowledged and must not be lost; in the others it may
+   * already have been restored and acknowledged. For an offset-committing broker (Kafka, where a commit is
+   * cumulative) the consumer is rewound. {@link redrive} reserves the whole batch before processing
+   * it, so an implementation must hand back every message it reserved and has not acknowledged
+   * (Kafka: every affected partition is sought back to its first unacknowledged record), not only
+   * `from`. `from` itself may already be acknowledged: it must then NOT be
+   * redelivered, only the others. It must never delete or acknowledge the message and must not alter
+   * its body. The Node counterpart of Go's optional `Rewinder`. A
+   * {@link RedriveIO} that omits it keeps the previous behaviour (the message is left unacknowledged).
+   */
+  rewind?(from: RedriveMessage): Promise<void>;
 }
 
 /** Options for {@link redrive}. */
@@ -127,6 +143,12 @@ function sourceQueueOf(envelope: Envelope): string {
  * dry-run, or undecodable) are never re-encountered in the same run. A message is acknowledged
  * only after its re-publish succeeds; an undecodable body is restored, not dropped. On a publish
  * failure the message is restored to the DLQ and the error is re-thrown.
+ *
+ * Whatever stops the run (a failed write, a failed restore, a throwing `select`, a failed ack), a
+ * {@link RedriveIO} implementing {@link RedriveIO.rewind} is asked to hand back every reserved,
+ * unacknowledged message, the rest of the batch included. When several steps failed (publish, restore,
+ * rewind) all errors are thrown together as one flat `AggregateError`; a lone error is thrown as is, and
+ * an IO without `rewind` rethrows the restore error as it always did.
  */
 export async function redrive(
   io: RedriveIO,
@@ -152,61 +174,105 @@ export async function redrive(
   const result: RedriveResult = { redriven: 0, skipped: 0, items: [] };
 
   for (const { message, envelope } of batch) {
-    if (!envelope) {
-      await republishFrom(io, dlq, message.body, message); // restore the undecodable body; never drop it
-      await message.ack();
-      result.skipped++;
-      result.items.push({ messageId: "", traceId: "", urn: "", reason: "", from: dlq, to: "", redriven: false, bypassed: false });
-      continue;
-    }
-
-    const item: RedriveItem = {
-      messageId: envelope.meta.id,
-      traceId: envelope.trace_id,
-      urn: EnvelopeCodec.urn(envelope),
-      reason: envelope.dead_letter?.reason ?? "",
-      from: dlq,
-      to: "",
-      redriven: false,
-      bypassed: false,
-    };
-
-    if (opts.select && !opts.select(envelope)) {
-      await republishFrom(io, dlq, message.body, message); // not selected: restore unchanged
-      await message.ack();
-      result.skipped++;
-      result.items.push(item);
-      continue;
-    }
-
-    const target = opts.toQueue ?? sourceQueueOf(envelope);
-    item.to = target;
-
-    if (opts.dryRun) {
-      await republishFrom(io, dlq, message.body, message); // report the plan; restore unchanged
-      await message.ack();
-      result.skipped++;
-      result.items.push(item);
-      continue;
-    }
-
-    const body = EnvelopeCodec.encode(resetForRedrive(envelope));
-    let bypassed: boolean;
     try {
-      bypassed = await publishRedriven(io, target, body, opts.bypass ?? false, message);
-    } catch (err) {
-      await republishFrom(io, dlq, message.body, message); // restore on a publish failure
+      if (!envelope) {
+        await restore(io, dlq, message); // restore the undecodable body; never drop it
+        result.skipped++;
+        result.items.push({ messageId: "", traceId: "", urn: "", reason: "", from: dlq, to: "", redriven: false, bypassed: false });
+        continue;
+      }
+
+      const item: RedriveItem = {
+        messageId: envelope.meta.id,
+        traceId: envelope.trace_id,
+        urn: EnvelopeCodec.urn(envelope),
+        reason: envelope.dead_letter?.reason ?? "",
+        from: dlq,
+        to: "",
+        redriven: false,
+        bypassed: false,
+      };
+
+      if (opts.select && !opts.select(envelope)) {
+        await restore(io, dlq, message); // not selected: restore unchanged
+        result.skipped++;
+        result.items.push(item);
+        continue;
+      }
+
+      const target = opts.toQueue ?? sourceQueueOf(envelope);
+      item.to = target;
+
+      if (opts.dryRun) {
+        await restore(io, dlq, message); // report the plan; restore unchanged
+        result.skipped++;
+        result.items.push(item);
+        continue;
+      }
+
+      const body = EnvelopeCodec.encode(resetForRedrive(envelope));
+      let bypassed: boolean;
+      try {
+        bypassed = await publishRedriven(io, target, body, opts.bypass ?? false, message);
+      } catch (err) {
+        try {
+          await restore(io, dlq, message); // restore on a publish failure
+        } catch (restoreErr) {
+          // Without a rewind capability the restore error is thrown as it always was; with one, every
+          // error of the failed step is reported together (flat), see handBack().
+          throw io.rewind ? new RedriveFailed([err, restoreErr]) : restoreErr;
+        }
+        throw err;
+      }
       await message.ack();
-      throw err;
+      item.redriven = true;
+      item.bypassed = bypassed;
+      result.redriven++;
+      result.items.push(item);
+    } catch (err) {
+      // The run stops here, so the rest of the reserved batch would never be processed: hand it back
+      // whatever stopped it (a failed write, a failed restore, a throwing `select`, a failed ack).
+      throw await handBack(io, message, err);
     }
-    await message.ack();
-    item.redriven = true;
-    item.bypassed = bypassed;
-    result.redriven++;
-    result.items.push(item);
   }
 
   return result;
+}
+
+/** Several errors of one failed step (publish, restore, rewind); a flat list so callers can nest it without wrapping. */
+class RedriveFailed extends AggregateError {
+  constructor(errors: unknown[]) {
+    super(errors, "redrive: more than one step failed (publish, restore, rewind); see errors");
+  }
+}
+
+/**
+ * Called when `message` stopped the run with `err`: an {@link RedriveIO} implementing
+ * {@link RedriveIO.rewind} is asked to hand back every reserved, unacknowledged message (Kafka: seek the
+ * consumer back, so a later cumulative commit cannot skip any of them). `message` itself may already be
+ * acknowledged (a restored message after a failed redrive write) and is then not redelivered. Returns the
+ * error to throw: `err` untouched, or, when the rewind failed too, all errors in one flat list.
+ */
+async function handBack(io: RedriveIO, message: RedriveMessage, err: unknown): Promise<unknown> {
+  if (!io.rewind) {
+    return err;
+  }
+  try {
+    await io.rewind(message);
+  } catch (rewindErr) {
+    return new RedriveFailed([...(err instanceof RedriveFailed ? err.errors : [err]), rewindErr]);
+  }
+  return err;
+}
+
+/**
+ * Restores `message` to `dlq` unchanged and acknowledges it. If the restore write fails the message is
+ * never acknowledged and the restore error is thrown ({@link redrive} then hands the batch back to an
+ * {@link RedriveIO} implementing {@link RedriveIO.rewind}).
+ */
+async function restore(io: RedriveIO, dlq: string, message: RedriveMessage): Promise<void> {
+  await republishFrom(io, dlq, message.body, message);
+  await message.ack();
 }
 
 /**
