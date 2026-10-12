@@ -11,10 +11,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [1.10.0] - 2026-10-12
 
-### Changed
-
-- Tests only: the vendored conformance suite is now 1.3.0 (exact-case envelope keys, last-wins duplicates: new `invalid-wrong-case-job`, `wrong-case-keys-roundtrip` and `duplicate-keys-last-wins` fixtures). No production change; the Node core already behaved this way.
-
 ### Added
 
 - `RedriveIO.rewind?(from)` — optional capability (the Node counterpart of Go's `Rewinder`). Whatever stops a
@@ -27,6 +23,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `AggregateError`; a lone error is thrown as is. A `RedriveIO` without `rewind` is unchanged, including
   the error thrown when a redrive write and its restore both fail (the restore error, as before).
   Additive, no wire change.
+
+### Changed
+
+- Tests only: the vendored conformance suite is now 1.3.0 (exact-case envelope keys, last-wins duplicates: new `invalid-wrong-case-job`, `wrong-case-keys-roundtrip` and `duplicate-keys-last-wins` fixtures). No production change; the Node core already behaved this way.
 
 ## [1.9.0] - 2026-10-11
 
