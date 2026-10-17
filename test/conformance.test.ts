@@ -283,13 +283,18 @@ function runForbiddenKeys(c: ForbiddenKeysCase, body: string): string[] {
 }
 
 /** The `extension_write` section runner for one case. */
-function runExtensionWrite(c: ExtensionWriteCase): string[] {
+function runExtensionWrite(c: ExtensionWriteCase, encode: (e: Envelope) => string = EnvelopeCodec.encode): string[] {
   const env = EnvelopeCodec.make(c.urn, c.data, { queue: c.queue, meta: c.meta });
-  const first = EnvelopeCodec.encode(env);
+  const first = encode(env);
   const violations = checkPreserved(JSON.parse(first), c.expect_envelope);
 
   // Re-emit chain: decode -> attempts + 1 -> encode; extension keys survive the hop.
-  const hop = EnvelopeCodec.decode(first, { onWarning: () => {} });
+  const warnings: string[] = [];
+  const hop = EnvelopeCodec.decode(first, { onWarning: (m) => warnings.push(m) });
+  if (warnings.length > 0) {
+    // `make` output is canonical, so decoding it must not warn (same rule as `roundtrip`).
+    violations.push(`a canonical message must not warn on decode, got ${JSON.stringify(warnings)}`);
+  }
   if (!EnvelopeCodec.accepts(hop)) {
     return [...violations, "the encoded message must be accepted"];
   }
@@ -470,6 +475,15 @@ test("runner: encode_reject and extension_write really fail on a wrong expectati
     expect_envelope: { "/meta/vendor_flag": true },
   };
   assert.deepEqual(runExtensionWrite(write), []);
+  // An encoder that leaks a forbidden key makes the decode hop warn; the runner must report it.
+  const leaky = (e: Envelope): string => {
+    const raw = JSON.parse(EnvelopeCodec.encode(e)) as { meta: Record<string, unknown> };
+    raw.meta.ts = 1;
+    return JSON.stringify(raw);
+  };
+  const leaked = runExtensionWrite(write, leaky);
+  assert.equal(leaked.length, 1, JSON.stringify(leaked));
+  assert.ok(leaked[0]?.startsWith("a canonical message must not warn on decode"));
   assert.ok(runExtensionWrite({ ...write, expect_envelope: { "/meta/vendor_flag": 1 } }).length >= 2);
 });
 
@@ -573,4 +587,63 @@ test("forbidden keys: encode throws for each non-canonical key instead of warnin
   const env = EnvelopeCodec.make("urn:x:y", {});
   (env as unknown as Record<string, unknown>).extra_top = "kept";
   assert.equal((JSON.parse(EnvelopeCodec.encode(env)) as Record<string, unknown>).extra_top, "kept");
+});
+
+test("decode: a urn that cannot stand in for a missing job is dropped with a warning", () => {
+  const base = JSON.parse(canonicalBody) as Record<string, unknown>;
+  delete base.job;
+  for (const urn of [123, null, {}, [], true]) {
+    const warnings: string[] = [];
+    const env = EnvelopeCodec.decode(JSON.stringify({ ...base, urn }), { onWarning: (m) => warnings.push(m) });
+    assert.ok(!("urn" in env), JSON.stringify(urn));
+    assert.ok(warnings.some((w) => w.includes("/urn")), JSON.stringify(urn));
+    assert.ok(!EnvelopeCodec.accepts(env), JSON.stringify(urn));
+    // The decoded object is re-encodable (no forbidden key is left on it).
+    assert.doesNotThrow(() => EnvelopeCodec.encode(env as Envelope));
+  }
+});
+
+test("decode: a non-string job keeps winning over urn, and urn is dropped with a warning", () => {
+  const base = JSON.parse(canonicalBody) as Record<string, unknown>;
+  const warnings: string[] = [];
+  const env = EnvelopeCodec.decode(JSON.stringify({ ...base, job: 5, urn: "urn:acme:b" }), {
+    onWarning: (m) => warnings.push(m),
+  });
+  assert.equal((env as unknown as Record<string, unknown>).job, 5);
+  assert.ok(!("urn" in env));
+  assert.ok(warnings.some((w) => w.includes("/urn")));
+  assert.doesNotThrow(() => EnvelopeCodec.encode(env as Envelope));
+});
+
+test("encode: the deprecated options argument is still accepted and its onWarning is never called", () => {
+  let called = false;
+  const env = EnvelopeCodec.make("urn:a:b", {});
+  EnvelopeCodec.encode(env, { onWarning: () => void (called = true) });
+  assert.equal(called, false);
+});
+
+test("make: meta is copied shallowly - top-level keys are detached, nested values are shared", () => {
+  const meta: Record<string, unknown> = { flag: true, ext: { acme: { tier: "gold" } } };
+  const env = EnvelopeCodec.make("urn:a:b", {}, { meta });
+  meta.flag = false;
+  meta.late = 1;
+  assert.equal(env.meta.flag, true);
+  assert.ok(!("late" in env.meta));
+  // Documented in MakeOptions.meta: nested values are shared, like `data`.
+  (meta.ext as { acme: { tier: string } }).acme.tier = "silver";
+  assert.deepEqual(env.meta.ext, { acme: { tier: "silver" } });
+});
+
+test("CHANGELOG: documents the exact encode error text and does not outrun package.json", () => {
+  const changelog = readFileSync(fileURLToPath(new URL("../CHANGELOG.md", import.meta.url)), "utf8");
+  const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")) as {
+    version: string;
+  };
+  // The text a user greps for after the warn -> throw change must be the real one.
+  const sample = new InvalidEnvelopeKeyError("<pointer>", "<reason>").message;
+  assert.equal(sample, "BabelQueue: cannot encode envelope key <pointer>: <reason>.");
+  assert.ok(changelog.includes("BabelQueue: cannot encode envelope key <pointer>: <reason>."));
+  // The newest dated release heading is the version package.json will publish.
+  const released = /^## \[(\d+\.\d+\.\d+)\]/m.exec(changelog)?.[1];
+  assert.equal(released, pkg.version);
 });

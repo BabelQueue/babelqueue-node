@@ -83,7 +83,8 @@ export interface MakeOptions {
    * e.g. `{ ext: { acme: { tier: "gold" } } }`. Throws {@link InvalidEnvelopeKeyError} when a
    * key collides with a core `meta` key (`id`, `queue`, `lang`, `schema_version`,
    * `created_at`) or is a non-canonical key (message-envelope.md section 10); the core never
-   * silently overwrites or drops a key.
+   * silently overwrites or drops a key. The map is copied shallowly (like `data`): nested
+   * values are shared with the envelope, so do not mutate them after `make`.
    */
   meta?: Record<string, unknown>;
 }
@@ -298,8 +299,8 @@ export const EnvelopeCodec = {
    * and produces no output (ADR-0031 (b)). Decode, by contrast, still drops them with a
    * warning. The second parameter is deprecated and ignored.
    */
-  encode(envelope: Envelope, ...deprecated: [options?: EncodeOptions]): string {
-    void deprecated;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- deprecated, kept for source compatibility
+  encode(envelope: Envelope, _options?: EncodeOptions): string {
     assertEncodable(envelope);
     return JSON.stringify(envelope);
   },
@@ -338,6 +339,11 @@ export const EnvelopeCodec = {
       } else if (typeof envelope.urn === "string") {
         envelope.job = envelope.urn;
         delete envelope.urn;
+      } else {
+        // No usable `job` and a `urn` that cannot stand in for it (number, null, object ...):
+        // the key is still never kept (ADR-0031 (c)), and dropping it is announced.
+        delete envelope.urn;
+        warn(forbiddenKeyMessage("/urn"));
       }
     }
     return envelope;

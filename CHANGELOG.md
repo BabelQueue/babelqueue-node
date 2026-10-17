@@ -9,10 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-## [1.11.0] - 2026-10-17
-
-Implements ADR-0031 (producer `meta` extension keys); conformance suite v1.4.0. The envelope stays at
-`schema_version: 1`.
+Planned as 1.11.0 (the version bump lands with the release commit). Implements ADR-0031 (producer
+`meta` extension keys); conformance suite v1.4.0. The envelope stays at `schema_version: 1`.
 
 ### Added
 
@@ -30,10 +28,13 @@ Implements ADR-0031 (producer `meta` extension keys); conformance suite v1.4.0. 
 
 - **`encode` throws `InvalidEnvelopeKeyError`** on a non-canonical key (top-level `timestamp` / `urn`,
   `meta.max_retries` / `attempts` / `source` / `ts`) instead of warning and dropping it. `decode` still
-  warns and drops. `process.emitWarning` / `onWarning` is now used for decode only.
+  warns and drops. `process.emitWarning` / `onWarning` is now used for decode only. The error message is
+  `BabelQueue: cannot encode envelope key <pointer>: <reason>.` (for example `... /meta/ts: non-canonical
+  envelope key (message-envelope.md section 10).`); `error.pointer` holds the RFC 6901 pointer.
 - `decode` falls back to `urn` when `job` is missing, empty or only ASCII whitespace
   (`[ \t\n\v\f\r]`, never Unicode spaces); the `urn` key is not kept. When `job` and `urn` are both
-  present, `job` wins and `urn` is dropped with a warning naming `/urn`.
+  present, `job` wins and `urn` is dropped with a warning naming `/urn`. A `urn` that is not a string and has no
+  usable `job` to stand in for (number, `null`, object ...) is dropped with the same warning.
 - `EnvelopeCodec.urn()` / `accepts()` use the same closed ASCII whitespace set instead of `trim()`.
 
 ### Deprecated
