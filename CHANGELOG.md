@@ -9,8 +9,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-Planned as 1.11.0 (the version bump lands with the release commit). Implements ADR-0031 (producer
-`meta` extension keys); conformance suite v1.4.0. The envelope stays at `schema_version: 1`.
+## [1.11.0] - 2026-10-17
+
+Implements ADR-0031 (producer `meta` extension keys); conformance suite v1.4.0. The envelope stays at `schema_version: 1`.
 
 ### Added
 
