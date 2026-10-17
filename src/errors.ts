@@ -28,3 +28,20 @@ export class InvalidPayloadError extends BabelQueueError {
     this.name = "InvalidPayloadError";
   }
 }
+
+/**
+ * Raised when a producer supplies an envelope key that must never be written: a
+ * non-canonical key (message-envelope.md section 10), a collision with a core `meta` key,
+ * or an alias key such as a top-level `urn` next to `job` (ADR-0031). Thrown by
+ * {@link EnvelopeCodec.make} and {@link EnvelopeCodec.encode}; decode never throws it.
+ */
+export class InvalidEnvelopeKeyError extends BabelQueueError {
+  constructor(
+    /** The offending key as an RFC 6901 pointer, e.g. `/meta/ts`. */
+    readonly pointer: string,
+    reason: string,
+  ) {
+    super(`BabelQueue: cannot encode envelope key ${pointer}: ${reason}.`);
+    this.name = "InvalidEnvelopeKeyError";
+  }
+}

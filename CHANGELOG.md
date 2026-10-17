@@ -9,6 +9,38 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-17
+
+Implements ADR-0031 (producer `meta` extension keys); conformance suite v1.4.0. The envelope stays at
+`schema_version: 1`.
+
+### Added
+
+- `MakeOptions.meta` — producer extension keys (flat keys or a `meta.ext.<vendor>` block), written into
+  `meta` and preserved across hops. A collision with a core `meta` key (`id`, `queue`, `lang`,
+  `schema_version`, `created_at`) or a forbidden key throws.
+- `InvalidEnvelopeKeyError` (extends `BabelQueueError`) with the offending RFC 6901 `pointer`.
+- `Meta` has an index signature (`[extension: string]: unknown`), so extension keys type-check; existing
+  code keeps compiling.
+- Conformance runner: `extension_write`, `encode_reject` (the Go-only `reject-repeated-key` case is
+  skipped), `expect_preserved`, `expect_absent_after_reencode`, `apply_dead_letter` (through `annotate`) and
+  `expect_dead_letter`, with unit tests that prove each field is evaluated.
+
+### Changed
+
+- **`encode` throws `InvalidEnvelopeKeyError`** on a non-canonical key (top-level `timestamp` / `urn`,
+  `meta.max_retries` / `attempts` / `source` / `ts`) instead of warning and dropping it. `decode` still
+  warns and drops. `process.emitWarning` / `onWarning` is now used for decode only.
+- `decode` falls back to `urn` when `job` is missing, empty or only ASCII whitespace
+  (`[ \t\n\v\f\r]`, never Unicode spaces); the `urn` key is not kept. When `job` and `urn` are both
+  present, `job` wins and `urn` is dropped with a warning naming `/urn`.
+- `EnvelopeCodec.urn()` / `accepts()` use the same closed ASCII whitespace set instead of `trim()`.
+
+### Deprecated
+
+- `EncodeOptions` / `encode(envelope, { onWarning })` — the option is accepted but never called, since
+  `encode` no longer warns.
+
 ## [1.10.0] - 2026-10-12
 
 ### Added

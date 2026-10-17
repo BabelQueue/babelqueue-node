@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { HasTraceId, PolyglotMessage } from "./contracts.js";
-import { BabelQueueError } from "./errors.js";
+import { BabelQueueError, InvalidEnvelopeKeyError } from "./errors.js";
 
 /** The wire envelope schema version this core implements (versioned independently of the package version). */
 export const SCHEMA_VERSION = 1;
@@ -17,6 +17,11 @@ export interface Meta {
   schema_version: number;
   /** Unix milliseconds, UTC. */
   created_at: number;
+  /**
+   * Producer extension keys (ADR-0031): flat vendor keys and the recommended
+   * `meta.ext.<vendor>` block. Unknown keys read off the wire are preserved here.
+   */
+  [extension: string]: unknown;
 }
 
 /** The additive block appended to an envelope when a message is dead-lettered. */
@@ -73,32 +78,42 @@ export interface MakeOptions {
   queue?: string;
   /** Reuse an existing trace id (trace continuation) instead of minting one. */
   traceId?: string;
+  /**
+   * Producer extension entries written into `meta` next to the core keys (ADR-0031 (b)),
+   * e.g. `{ ext: { acme: { tier: "gold" } } }`. Throws {@link InvalidEnvelopeKeyError} when a
+   * key collides with a core `meta` key (`id`, `queue`, `lang`, `schema_version`,
+   * `created_at`) or is a non-canonical key (message-envelope.md section 10); the core never
+   * silently overwrites or drops a key.
+   */
+  meta?: Record<string, unknown>;
 }
 
 /** Options for {@link EnvelopeCodec.decode}. */
 export interface DecodeOptions {
   /**
    * Receives one human-readable warning per non-canonical key found on the wire
-   * (message-envelope.md §10). The message always names the key as an RFC 6901
-   * pointer (e.g. `/meta/max_retries`). Called for every occurrence. Defaults to
+   * (message-envelope.md §10) and per `urn` alias dropped because `job` is present
+   * (ADR-0031 (c)). The message always names the key as an RFC 6901
+   * pointer (e.g. `/meta/max_retries`, `/urn`). Called for every occurrence. Defaults to
    * `process.emitWarning` with the code {@link FORBIDDEN_KEY_WARNING_CODE}, emitted
    * once per key per process so a high-volume legacy producer cannot flood stderr.
    */
   onWarning?: (message: string) => void;
 }
 
-/** Options for {@link EnvelopeCodec.encode}. */
+/**
+ * Options for {@link EnvelopeCodec.encode}.
+ *
+ * @deprecated `encode` no longer warns and drops non-canonical keys; it throws
+ * {@link InvalidEnvelopeKeyError} (ADR-0031 (b)). `onWarning` is accepted for source
+ * compatibility and is never called.
+ */
 export interface EncodeOptions {
-  /**
-   * Receives one human-readable warning per non-canonical key the caller put on the
-   * envelope (message-envelope.md §10); the key is left out of the output. Called
-   * for every occurrence. Defaults to `process.emitWarning` with the code
-   * {@link FORBIDDEN_KEY_WARNING_CODE}, emitted once per key per process.
-   */
+  /** @deprecated Never called; `encode` throws instead of warning. */
   onWarning?: (message: string) => void;
 }
 
-/** The `process.emitWarning` code used for dropped non-canonical keys. */
+/** The `process.emitWarning` code used for keys dropped on decode. */
 export const FORBIDDEN_KEY_WARNING_CODE = "BABELQUEUE_FORBIDDEN_KEY";
 
 /** Non-canonical top-level keys (message-envelope.md §10). */
@@ -120,18 +135,17 @@ function defaultWarning(message: string): void {
 
 /**
  * Remove every non-canonical key from `envelope` in place, reporting each one via
- * `warn` (when given). Returns the same object for chaining.
+ * `warn`. Returns the same object for chaining.
  */
 function stripForbiddenKeys<T extends object>(
   envelope: T,
-  warn?: (message: string) => void,
-  message: (pointer: string) => string = forbiddenKeyMessage,
+  warn: (message: string) => void,
 ): T {
   const record = envelope as Record<string, unknown>;
   for (const key of FORBIDDEN_TOP_LEVEL_KEYS) {
     if (Object.prototype.hasOwnProperty.call(record, key)) {
       delete record[key];
-      warn?.(message(`/${key}`));
+      warn(forbiddenKeyMessage(`/${key}`));
     }
   }
   const meta = record.meta;
@@ -140,32 +154,71 @@ function stripForbiddenKeys<T extends object>(
     for (const key of FORBIDDEN_META_KEYS) {
       if (Object.prototype.hasOwnProperty.call(metaRecord, key)) {
         delete metaRecord[key];
-        warn?.(message(`/meta/${key}`));
+        warn(forbiddenKeyMessage(`/meta/${key}`));
       }
     }
   }
   return envelope;
 }
 
-function hasForbiddenKeys(envelope: object): boolean {
+/** The core `meta` keys a producer can never override (message-envelope.md section 3). */
+const CORE_META_KEYS = ["id", "queue", "lang", "schema_version", "created_at"] as const;
+
+/** The closed ASCII whitespace set of ADR-0031 (c): space, \t, \n, \v, \f, \r. Never `trim()`, which also cuts Unicode spaces. */
+const ASCII_BLANK = /^[ \t\n\v\f\r]*$/;
+const ASCII_EDGE_WHITESPACE = /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g;
+
+function isAsciiBlank(value: string): boolean {
+  return ASCII_BLANK.test(value);
+}
+
+function hasOwn(record: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Throw {@link InvalidEnvelopeKeyError} for the first non-canonical key found on an
+ * envelope about to be encoded (message-envelope.md section 10): top-level `timestamp`
+ * and `urn` (the inbound alias is never written), `meta.max_retries|attempts|source|ts`.
+ */
+function assertEncodable(envelope: object): void {
   const record = envelope as Record<string, unknown>;
-  if (FORBIDDEN_TOP_LEVEL_KEYS.some((k) => Object.prototype.hasOwnProperty.call(record, k))) {
-    return true;
+  for (const key of FORBIDDEN_TOP_LEVEL_KEYS) {
+    if (hasOwn(record, key)) {
+      throw new InvalidEnvelopeKeyError(`/${key}`, "non-canonical envelope key (message-envelope.md section 10)");
+    }
+  }
+  if (hasOwn(record, "urn")) {
+    throw new InvalidEnvelopeKeyError("/urn", "the inbound alias of `job` is never written (message-envelope.md section 10)");
   }
   const meta = record.meta;
-  return (
-    meta !== null &&
-    typeof meta === "object" &&
-    FORBIDDEN_META_KEYS.some((k) => Object.prototype.hasOwnProperty.call(meta, k))
-  );
+  if (meta !== null && typeof meta === "object" && !Array.isArray(meta)) {
+    for (const key of FORBIDDEN_META_KEYS) {
+      if (hasOwn(meta, key)) {
+        throw new InvalidEnvelopeKeyError(`/meta/${key}`, "non-canonical envelope key (message-envelope.md section 10)");
+      }
+    }
+  }
+}
+
+/** Validate producer `meta` entries and return a shallow copy (ADR-0031 (b)). */
+function checkProducerMeta(meta: Record<string, unknown>): Record<string, unknown> {
+  if (meta === null || typeof meta !== "object" || Array.isArray(meta)) {
+    throw new BabelQueueError("MakeOptions.meta must be an object of extension entries.");
+  }
+  for (const key of Object.keys(meta)) {
+    if ((CORE_META_KEYS as readonly string[]).includes(key)) {
+      throw new InvalidEnvelopeKeyError(`/meta/${key}`, "collides with a core meta key");
+    }
+    if ((FORBIDDEN_META_KEYS as readonly string[]).includes(key)) {
+      throw new InvalidEnvelopeKeyError(`/meta/${key}`, "non-canonical envelope key (message-envelope.md section 10)");
+    }
+  }
+  return { ...meta };
 }
 
 function forbiddenKeyMessage(pointer: string): string {
   return `BabelQueue: dropped non-canonical envelope key ${pointer} (message-envelope.md §10); it is never re-emitted.`;
-}
-
-function forbiddenEncodeKeyMessage(pointer: string): string {
-  return `BabelQueue: not encoding non-canonical envelope key ${pointer} (message-envelope.md §10); remove it from the envelope.`;
 }
 
 /**
@@ -179,7 +232,10 @@ export const EnvelopeCodec = {
   /**
    * Build the canonical envelope for a `(urn, data)` pair. Mints a fresh trace id
    * unless `options.traceId` is given, starts `attempts` at 0, and stamps `meta`.
-   * Throws {@link BabelQueueError} when the URN is blank.
+   * `options.meta` entries are written into `meta` next to the core keys (ADR-0031).
+   * Throws {@link BabelQueueError} when the URN is blank, and
+   * {@link InvalidEnvelopeKeyError} when `options.meta` collides with a core `meta` key or
+   * carries a non-canonical key.
    */
   make(
     urn: string,
@@ -195,6 +251,8 @@ export const EnvelopeCodec = {
 
     const traceId = (options.traceId ?? "").trim() || randomUUID();
 
+    const extension = options.meta === undefined ? {} : checkProducerMeta(options.meta);
+
     return {
       job: resolvedUrn,
       trace_id: traceId,
@@ -205,6 +263,7 @@ export const EnvelopeCodec = {
         lang: SOURCE_LANG,
         schema_version: SCHEMA_VERSION,
         created_at: Date.now(),
+        ...extension,
       },
       attempts: 0,
     };
@@ -234,25 +293,27 @@ export const EnvelopeCodec = {
    * Encode the envelope as compact UTF-8 JSON. `JSON.stringify` already emits the
    * canonical form — no spaces, and slashes/unicode/HTML left unescaped — matching
    * the other SDK cores. Non-canonical keys (message-envelope.md §10) are never
-   * emitted: if the caller put one on the envelope it is left out of the output and
-   * a warning names it (the caller's object is not modified).
+   * written: if the caller put one on the envelope (top-level `timestamp` or `urn`,
+   * `meta.max_retries|attempts|source|ts`) this throws {@link InvalidEnvelopeKeyError}
+   * and produces no output (ADR-0031 (b)). Decode, by contrast, still drops them with a
+   * warning. The second parameter is deprecated and ignored.
    */
-  encode(envelope: Envelope, options: EncodeOptions = {}): string {
-    if (hasForbiddenKeys(envelope)) {
-      const copy = { ...envelope, meta: { ...envelope.meta } };
-      const warn = options?.onWarning ?? defaultWarning;
-      return JSON.stringify(stripForbiddenKeys(copy, warn, forbiddenEncodeKeyMessage));
-    }
+  encode(envelope: Envelope, ...deprecated: [options?: EncodeOptions]): string {
+    void deprecated;
+    assertEncodable(envelope);
     return JSON.stringify(envelope);
   },
 
   /**
    * Parse a raw JSON body. Returns `{}` for malformed or non-object input (call
    * {@link EnvelopeCodec.accepts} before trusting it). Resolves the `urn` inbound
-   * alias into `job`. Unknown keys are kept (forward compatibility); the
-   * non-canonical keys of message-envelope.md §10 (`timestamp`, `meta.max_retries`,
-   * `meta.attempts`, `meta.source`, `meta.ts`) are dropped with a warning — decode
-   * still succeeds so older producers keep working.
+   * alias into `job` (ADR-0031 (c)): a missing, empty or ASCII-whitespace-only `job`
+   * (space, `\t`, `\n`, `\v`, `\f`, `\r`) counts as absent and the URN is read from `urn`;
+   * if `job` is present, `job` wins and a `urn` next to it is dropped with a warning
+   * naming `/urn`. The `urn` key is never kept on the decoded envelope. Unknown keys are
+   * kept (forward compatibility); the non-canonical keys of message-envelope.md §10
+   * (`timestamp`, `meta.max_retries`, `meta.attempts`, `meta.source`, `meta.ts`) are
+   * dropped with a warning — decode still succeeds so older producers keep working.
    */
   decode(raw: string, options: DecodeOptions = {}): IncomingEnvelope {
     let parsed: unknown;
@@ -265,20 +326,34 @@ export const EnvelopeCodec = {
       return {};
     }
 
-    const envelope = stripForbiddenKeys(
-      parsed as IncomingEnvelope,
-      options.onWarning ?? defaultWarning,
-    );
-    if (!envelope.job && typeof envelope.urn === "string") {
-      envelope.job = envelope.urn;
+    const warn = options.onWarning ?? defaultWarning;
+    const envelope = stripForbiddenKeys(parsed as IncomingEnvelope, warn);
+    if (hasOwn(envelope, "urn")) {
+      const job: unknown = envelope.job;
+      const jobAbsent =
+        job === undefined || job === null || (typeof job === "string" && isAsciiBlank(job));
+      if (!jobAbsent) {
+        delete envelope.urn;
+        warn(forbiddenKeyMessage("/urn"));
+      } else if (typeof envelope.urn === "string") {
+        envelope.job = envelope.urn;
+        delete envelope.urn;
+      }
     }
     return envelope;
   },
 
-  /** The message URN — canonical `job`, with `urn` accepted as an alias. */
+  /**
+   * The message URN — canonical `job`, with `urn` accepted as an alias. Surrounding ASCII
+   * whitespace is cut and a blank value is `""`; only the closed ASCII set (space, `\t`,
+   * `\n`, `\v`, `\f`, `\r`) counts, never Unicode spaces such as U+2003.
+   */
   urn(envelope: IncomingEnvelope): string {
     const value = envelope?.job ?? envelope?.urn ?? "";
-    return typeof value === "string" ? value.trim() : "";
+    if (typeof value !== "string" || isAsciiBlank(value)) {
+      return "";
+    }
+    return value.replace(ASCII_EDGE_WHITESPACE, "");
   },
 
   /**

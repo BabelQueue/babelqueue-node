@@ -89,6 +89,29 @@ const env = EnvelopeCodec.fromMessage(new OrderCreated(1042), "orders");
 Continue an existing trace by adding `getBabelTraceId(): string | null` (see
 `HasTraceId`), or pass `{ traceId }` to `EnvelopeCodec.make`.
 
+### Producer extension keys (`meta`)
+
+Add your own keys to `meta` with `MakeOptions.meta` (ADR-0031). Use flat keys or a vendor block
+under `meta.ext.<vendor>`; every SDK preserves them verbatim across hops.
+
+```ts
+const env = EnvelopeCodec.make(
+  "urn:babel:orders:created",
+  { order_id: 1042 },
+  { queue: "orders", meta: { ext: { acme: { tier: "gold" } } } },
+);
+```
+
+`make` throws `InvalidEnvelopeKeyError` (a `BabelQueueError`; `pointer` holds the RFC 6901 pointer)
+when `meta` collides with a core key (`id`, `queue`, `lang`, `schema_version`, `created_at`) or with a
+forbidden key (`meta.max_retries`, `meta.attempts`, `meta.source`, `meta.ts`). `encode` also throws
+`InvalidEnvelopeKeyError` for any non-canonical key still on the envelope (top-level `timestamp` or
+`urn`, the four forbidden `meta` keys) instead of dropping it. `decode` is lenient: it warns and drops
+them, and `process.emitWarning` / `onWarning` is used for **decode only**.
+
+On decode, a `job` that is missing, empty or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`)
+falls back to `urn`; when both are present `job` wins and `urn` is dropped with a `/urn` warning.
+
 ### Dead-letter
 
 ```ts

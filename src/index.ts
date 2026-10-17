@@ -38,7 +38,12 @@ export * as deadLetter from "./deadLetter.js";
 
 export { UnknownUrnStrategy } from "./routing.js";
 
-export { BabelQueueError, UnknownUrnError, InvalidPayloadError } from "./errors.js";
+export {
+  BabelQueueError,
+  UnknownUrnError,
+  InvalidPayloadError,
+  InvalidEnvelopeKeyError,
+} from "./errors.js";
 
 export { Wrap, InMemoryStore } from "./idempotency.js";
 export type { Handler, Store } from "./idempotency.js";
