@@ -1,17 +1,26 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
-import { test } from "node:test";
+import { after, test } from "node:test";
+
+import { trace } from "@opentelemetry/api";
 
 import {
   BabelQueueError,
   EnvelopeCodec,
   FORBIDDEN_KEY_WARNING_CODE,
+  NON_STRING_JOB_WARNING_CODE,
+  InMemoryStore,
   InvalidEnvelopeKeyError,
+  Wrap,
   annotate,
 } from "../src/index.js";
 import type { Envelope } from "../src/index.js";
+import { remoteParentFromHeaders, traceIdOf } from "../src/otel.js";
+import { validateSchema } from "../src/schema.js";
+import type { SchemaNode } from "../src/schema.js";
 
 interface ConformanceCase {
   name: string;
@@ -39,6 +48,146 @@ const readJson = (relative: string): string =>
 
 const manifest = JSON.parse(readJson("manifest.json")) as Manifest;
 
+// --- results.json collection (ADR-0032 section 2) ---------------------------------
+// Every section runner reports through `runCase`, so the per-case outcome lands in
+// `results` whether the case passes or fails. `BQ_CONFORMANCE_RESULTS` names the file the
+// collected results are written to; with the variable unset nothing is written.
+
+interface CaseResult {
+  status: "pass" | "fail" | "skip";
+  reason?: string;
+}
+
+const results: Record<string, Record<string, CaseResult>> = {};
+
+function recordResult(section: string, id: string, result: CaseResult): void {
+  (results[section] ??= {})[id] = result;
+}
+
+async function runCase(section: string, id: string, fn: () => void | Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    recordResult(section, id, { status: "fail", reason: message.slice(0, 500) || "failed" });
+    throw error;
+  }
+  recordResult(section, id, { status: "pass" });
+}
+
+const packageRoot = new URL("../", import.meta.url);
+const packageJson = JSON.parse(readFileSync(fileURLToPath(new URL("package.json", packageRoot)), "utf8")) as {
+  version: string;
+  exports?: Record<string, unknown>;
+};
+
+/**
+ * Transport / helper names that denote a conformance binding (`redis`, `rabbitmq` -> `amqp`, ...).
+ * The one table is `scripts/conformance-bindings.json`, shared with the CI completeness gate.
+ */
+const BINDING_BY_EXPORT = JSON.parse(
+  readFileSync(fileURLToPath(new URL("scripts/conformance-bindings.json", packageRoot)), "utf8"),
+) as Record<string, string>;
+
+/** Binding names found in `src/`: any file or directory (at any depth) named after a known transport. */
+function sourceBindingNames(dir: string): string[] {
+  const names: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const base = entry.name.replace(/\.[cm]?[jt]s$/, "").toLowerCase();
+    if (Object.hasOwn(BINDING_BY_EXPORT, base)) {
+      names.push(base);
+    }
+    if (entry.isDirectory()) {
+      names.push(...sourceBindingNames(`${dir}/${entry.name}`));
+    }
+  }
+  return names;
+}
+
+/**
+ * Every binding this package carries, derived (never hard-coded) from two independent sources:
+ * the public export map (any path segment of an export key, so `./otel` and `./transports/redis`
+ * both count) and the `src/` tree (a transport shipped without an export is still carried).
+ */
+function deriveBindings(): string[] {
+  const bindings = new Set<string>();
+  const names = new Set<string>(sourceBindingNames(fileURLToPath(new URL("src", packageRoot))));
+  for (const key of Object.keys(packageJson.exports ?? {})) {
+    for (const segment of key.split("/")) {
+      names.add(segment.toLowerCase());
+    }
+  }
+  for (const name of names) {
+    if (Object.hasOwn(BINDING_BY_EXPORT, name)) {
+      bindings.add(BINDING_BY_EXPORT[name] as string);
+    }
+  }
+  return [...bindings].sort();
+}
+
+const bindings = deriveBindings();
+
+const fullManifest = JSON.parse(readJson("manifest.json")) as Record<string, unknown> & {
+  sections: Record<string, { scope: string }>;
+};
+
+/** Case ids of one section, per the rules of `schema/results.schema.json`. */
+function expectedCaseIds(name: string): string[] {
+  const body = fullManifest[name] as Record<string, unknown> | unknown[];
+  const caseId = (section: string, c: unknown, index: number): string => {
+    const named = (c as { name?: unknown } | null)?.name;
+    return typeof named === "string" ? named : `${section}#${index}`;
+  };
+  if (Array.isArray(body)) {
+    return body.map((c, i) => caseId(name, c, i));
+  }
+  const ids: string[] = [];
+  if (Array.isArray(body.cases)) {
+    ids.push(...body.cases.map((c, i) => caseId(name, c, i)));
+  }
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "cases" || key === "description" || key === "schema") continue;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    const sub = value as { cases?: unknown };
+    if (Array.isArray(sub.cases)) {
+      ids.push(...sub.cases.map((c, i) => `${key}/${typeof (c as { name?: unknown }).name === "string" ? (c as { name: string }).name : i}`));
+    } else {
+      ids.push(key);
+    }
+  }
+  return ids;
+}
+
+/** Sections in scope for this package: `core` plus every derived binding (from the manifest `sections` map). */
+function inScopeSections(): string[] {
+  return Object.entries(fullManifest.sections)
+    .filter(([, def]) => def.scope === "core" || bindings.includes(def.scope))
+    .map(([name]) => name);
+}
+
+after(() => {
+  const target = process.env.BQ_CONFORMANCE_RESULTS;
+  if (target === undefined || target === "") {
+    return;
+  }
+  const sections: Record<string, Record<string, CaseResult>> = {};
+  for (const name of Object.keys(fullManifest.sections)) {
+    if (results[name] !== undefined) {
+      sections[name] = results[name];
+    }
+  }
+  const document = {
+    sdk: "babelqueue-node/core",
+    version: packageJson.version,
+    conformance_version: readJson("CONFORMANCE_VERSION").trim(),
+    generated_at: new Date().toISOString(),
+    bindings,
+    sections,
+  };
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, `${JSON.stringify(document, null, 2)}\n`);
+});
+
 test("conformance manifest matches the core schema version", () => {
   assert.equal(manifest.schema_version, EnvelopeCodec.SCHEMA_VERSION);
   assert.ok(manifest.cases.length > 0, "manifest has no cases");
@@ -48,7 +197,7 @@ test("conformance manifest matches the core schema version", () => {
 // satisfy. Per-message fields (meta.id, trace_id, meta.created_at) are
 // intrinsically unique and are checked for presence, not value.
 for (const testCase of manifest.cases) {
-  test(`conformance: ${testCase.name}`, () => {
+  test(`conformance: ${testCase.name}`, () => runCase("cases", testCase.name, () => {
     const body = readJson(testCase.file);
     const env = EnvelopeCodec.decode(body);
 
@@ -90,7 +239,7 @@ for (const testCase of manifest.cases) {
         );
       }
     }
-  });
+  }));
 }
 
 // --- Behaviour conformance (roundtrip / data_shape / forbidden_keys / extension_write / encode_reject) ---
@@ -340,13 +489,13 @@ test("conformance: behaviour sections are present", () => {
 });
 
 for (const c of behaviour.roundtrip?.cases ?? []) {
-  test(`conformance roundtrip: ${c.name}`, () => {
+  test(`conformance roundtrip: ${c.name}`, () => runCase("roundtrip", c.name, () => {
     assert.deepEqual(runRoundtrip(c, readJson(c.file)), []);
-  });
+  }));
 }
 
 for (const c of behaviour.data_shape?.cases ?? []) {
-  test(`conformance data_shape: ${c.name}`, () => {
+  test(`conformance data_shape: ${c.name}`, () => runCase("data_shape", c.name, () => {
     if (c.mode === "encode") {
       const env = EnvelopeCodec.make(c.urn, c.data, { queue: c.queue });
       const expected = JSON.stringify(JSON.parse(c.expect_encoded_data_json));
@@ -355,29 +504,336 @@ for (const c of behaviour.data_shape?.cases ?? []) {
     }
     const verdict = EnvelopeCodec.accepts(EnvelopeCodec.decode(readJson(c.file)));
     assert.equal(verdict, c.valid, c.reason ?? "");
-  });
+  }));
 }
 
 for (const c of behaviour.forbidden_keys?.cases ?? []) {
-  test(`conformance forbidden_keys: ${c.name}`, () => {
+  test(`conformance forbidden_keys: ${c.name}`, () => runCase("forbidden_keys", c.name, () => {
     assert.equal(c.expect, "warn");
     assert.deepEqual(runForbiddenKeys(c, readJson(c.file)), []);
-  });
+  }));
 }
 
 for (const c of behaviour.extension_write?.cases ?? []) {
-  test(`conformance extension_write: ${c.name}`, () => {
+  test(`conformance extension_write: ${c.name}`, () => runCase("extension_write", c.name, () => {
     assert.deepEqual(runExtensionWrite(c), []);
-  });
+  }));
 }
 
 for (const c of behaviour.encode_reject?.cases ?? []) {
   // `meta_entries` is a repeated key, which one `MakeOptions.meta` map cannot express.
-  test(`conformance encode_reject: ${c.name}`, { skip: c.meta_entries !== undefined }, () => {
+  if (c.meta_entries !== undefined) {
+    recordResult("encode_reject", c.name, {
+      status: "skip",
+      reason:
+        "ADR-0031 (b): a repeated extension key is not expressible through the single-map MakeOptions.meta write API; the manifest allows every SDK except Go to skip it",
+    });
+  }
+  test(`conformance encode_reject: ${c.name}`, { skip: c.meta_entries !== undefined }, () => runCase("encode_reject", c.name, () => {
     assert.equal(c.expect, "reject");
     assert.deepEqual(runEncodeReject(c), []);
-  });
+  }));
 }
+
+// --- trim, job_type, traceparent (conformance v1.5.0, ADR-0032 / ADR-0028) -----------
+
+const nodeSections = fullManifest as unknown as {
+  trim: { cases: TrimCase[] };
+  job_type: { cases: JobTypeCase[] };
+  traceparent: { cases: TraceparentCase[] };
+  idempotency: {
+    dedup_key: { envelope_file: string; expected_key: string };
+    sequences: { cases: IdempotencyCase[] };
+  };
+  payload_schema: { schema: SchemaNode; cases: PayloadSchemaCase[] };
+  payload_schema_unicode: { schema: SchemaNode; cases: PayloadSchemaCase[] };
+};
+
+interface TrimCase {
+  name: string;
+  mode: "make" | "decode" | "accepts" | "reemit";
+  urn?: string;
+  trace_id?: string;
+  file?: string;
+  valid?: boolean;
+  expect?: "reject" | { job?: string; trace_id?: string; urn?: string };
+  expect_warning?: boolean;
+  expect_accepts?: boolean;
+  expect_decode_ok?: boolean;
+  expect_attempts?: number;
+  expect_preserved?: Record<string, unknown>;
+}
+
+interface JobTypeCase {
+  name: string;
+  file: string;
+  valid: boolean;
+  expect?: { urn: string };
+  expect_warning?: boolean;
+}
+
+interface TraceparentCase {
+  name: string;
+  mode: "extract";
+  traceparent: string | null;
+  trace_id: string;
+  expect: { source: string; trace_id_hex: string; parent_span_id?: string; flags?: string };
+}
+
+interface IdempotencyDelivery {
+  meta_id: string;
+  expect_effect: "run" | "skip";
+  outcome?: "ok" | "throw";
+  forget_before?: boolean;
+}
+
+interface IdempotencyCase {
+  name: string;
+  deliveries: IdempotencyDelivery[];
+  expected_effects: number;
+}
+
+interface PayloadSchemaCase {
+  name: string;
+  valid: boolean;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Decode `raw`, collecting warnings. The Node decoder never throws: "decode raises" in the
+ * manifest maps to a result without a usable identity (`urn()` is `""`, so `accepts` is false).
+ */
+function decodeCollectingWarnings(raw: string): { env: ReturnType<typeof EnvelopeCodec.decode>; warnings: string[] } {
+  const warnings: string[] = [];
+  const env = EnvelopeCodec.decode(raw, { onWarning: (m) => warnings.push(m) });
+  return { env, warnings };
+}
+
+/** The decode / job_type verdict for one case: `[]` when the case holds, else the violations. */
+function checkDecodeIdentity(
+  raw: string,
+  valid: boolean,
+  expectUrn: string | undefined,
+  expectWarning: boolean | undefined,
+): string[] {
+  const { env, warnings } = decodeCollectingWarnings(raw);
+  const identity = EnvelopeCodec.urn(env);
+  if (!valid) {
+    return identity === "" ? [] : [`decode must yield no valid identity, got ${JSON.stringify(identity)}`];
+  }
+  const violations: string[] = [];
+  if (identity !== expectUrn) {
+    violations.push(`identity must be ${JSON.stringify(expectUrn)}, got ${JSON.stringify(identity)}`);
+  }
+  if (expectWarning !== undefined) {
+    // A warning is expected specifically about the non-string `job` (ADR-0032 section 6), not any warning.
+    const jobWarnings = warnings.filter((w) => w.includes("/job"));
+    if (jobWarnings.length > 0 !== expectWarning || (!expectWarning && warnings.length > 0)) {
+      violations.push(`warning about /job expected=${String(expectWarning)}, got ${JSON.stringify(warnings)}`);
+    }
+  }
+  return violations;
+}
+
+/** The `trim` runner for one case. */
+function runTrim(c: TrimCase): string[] {
+  switch (c.mode) {
+    case "make": {
+      let env: Envelope | undefined;
+      let failure: unknown;
+      try {
+        env = EnvelopeCodec.make(c.urn ?? "", {}, c.trace_id === undefined ? {} : { traceId: c.trace_id });
+      } catch (error) {
+        failure = error;
+      }
+      if (c.expect === "reject") {
+        return failure instanceof BabelQueueError ? [] : ["make must reject a URN that is blank after trimming"];
+      }
+      if (env === undefined || c.expect === undefined) {
+        return [`make must succeed, got ${String(failure)}`];
+      }
+      const violations: string[] = [];
+      if (c.expect.job !== undefined && env.job !== c.expect.job) {
+        violations.push(`job must be ${JSON.stringify(c.expect.job)}, got ${JSON.stringify(env.job)}`);
+      }
+      if (c.expect.trace_id !== undefined && env.trace_id !== c.expect.trace_id) {
+        violations.push(`trace_id must be ${JSON.stringify(c.expect.trace_id)}, got ${JSON.stringify(env.trace_id)}`);
+      }
+      return violations;
+    }
+    case "decode": {
+      const expectUrn = typeof c.expect === "object" ? c.expect.urn : undefined;
+      return checkDecodeIdentity(readJson(c.file ?? ""), c.valid === true, expectUrn, c.expect_warning);
+    }
+    case "accepts": {
+      const { env } = decodeCollectingWarnings(readJson(c.file ?? ""));
+      const violations: string[] = [];
+      if (EnvelopeCodec.accepts(env) !== c.expect_accepts) {
+        violations.push(`accepts must be ${String(c.expect_accepts)}`);
+      }
+      if (c.expect_decode_ok === true && (Object.keys(env).length === 0 || typeof env.trace_id !== "string")) {
+        violations.push("decode itself must succeed");
+      }
+      return violations;
+    }
+    case "reemit": {
+      const { env } = decodeCollectingWarnings(readJson(c.file ?? ""));
+      const hop = env as Envelope;
+      hop.attempts += 1;
+      const second = JSON.parse(EnvelopeCodec.encode(hop)) as unknown;
+      const violations = checkPreserved(second, c.expect_preserved ?? {}).map((v) => `after re-emit: ${v}`);
+      if (c.expect_attempts !== undefined && resolvePointer(second, "/attempts") !== c.expect_attempts) {
+        violations.push(`after re-emit: /attempts must be ${String(c.expect_attempts)}`);
+      }
+      return violations;
+    }
+    default:
+      return [`unknown trim mode ${String((c as { mode: unknown }).mode)}`];
+  }
+}
+
+/** The consumer-side traceparent extraction (ADR-0028): header first, else the envelope `trace_id`. */
+function extractTrace(c: TraceparentCase): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (typeof c.traceparent === "string") {
+    headers.traceparent = c.traceparent;
+  }
+  const remote = remoteParentFromHeaders(headers);
+  const spanContext = remote === undefined ? undefined : trace.getSpanContext(remote);
+  if (spanContext !== undefined) {
+    return {
+      source: "traceparent",
+      trace_id_hex: spanContext.traceId,
+      parent_span_id: spanContext.spanId,
+      flags: spanContext.traceFlags.toString(16).padStart(2, "0"),
+    };
+  }
+  return { source: "trace_id", trace_id_hex: traceIdOf(c.trace_id) };
+}
+
+/** Replays one idempotency sequence through `Wrap` + `InMemoryStore`. */
+async function runIdempotencySequence(c: IdempotencyCase): Promise<string[]> {
+  const store = new InMemoryStore();
+  const violations: string[] = [];
+  let invoked = 0;
+  let effects = 0;
+  for (const [index, delivery] of c.deliveries.entries()) {
+    if (delivery.forget_before === true) {
+      store.forget(delivery.meta_id);
+    }
+    const before = invoked;
+    const env = EnvelopeCodec.make("urn:acme:a", {});
+    (env.meta as unknown as Record<string, unknown>).id = delivery.meta_id;
+    const throwing = delivery.outcome === "throw";
+    const guarded = Wrap(store, (): void => {
+      invoked += 1;
+      if (throwing) {
+        throw new Error("handler failed");
+      }
+    });
+    try {
+      await guarded(env);
+    } catch {
+      // a failed run leaves the id unmarked (a later redelivery runs again)
+    }
+    if (invoked > before) {
+      effects += 1; // every handler invocation counts, a throwing one included (expected_effects)
+    }
+    const effect = invoked > before ? "run" : "skip";
+    if (effect !== delivery.expect_effect) {
+      violations.push(`delivery ${String(index)} (${delivery.meta_id}): expected ${delivery.expect_effect}, got ${effect}`);
+    }
+  }
+  if (effects !== c.expected_effects) {
+    violations.push(`expected ${String(c.expected_effects)} effects, got ${String(effects)}`);
+  }
+  return violations;
+}
+
+for (const c of nodeSections.trim.cases) {
+  test(`conformance trim: ${c.name}`, () => runCase("trim", c.name, () => {
+    assert.deepEqual(runTrim(c), []);
+  }));
+}
+
+for (const c of nodeSections.job_type.cases) {
+  test(`conformance job_type: ${c.name}`, () => runCase("job_type", c.name, () => {
+    assert.deepEqual(checkDecodeIdentity(readJson(c.file), c.valid, c.expect?.urn, c.expect_warning), []);
+  }));
+}
+
+for (const c of nodeSections.traceparent.cases) {
+  test(`conformance traceparent: ${c.name}`, () => runCase("traceparent", c.name, () => {
+    assert.equal(c.mode, "extract");
+    const expected: Record<string, string> = { ...c.expect };
+    assert.deepEqual(extractTrace(c), expected);
+  }));
+}
+
+test("conformance idempotency: dedup_key", () => runCase("idempotency", "dedup_key", () => {
+  const key = nodeSections.idempotency.dedup_key;
+  const env = EnvelopeCodec.decode(readJson(key.envelope_file));
+  assert.equal((env as Envelope).meta.id, key.expected_key);
+}));
+
+for (const c of nodeSections.idempotency.sequences.cases) {
+  test(`conformance idempotency: ${c.name}`, () => runCase("idempotency", `sequences/${c.name}`, async () => {
+    assert.deepEqual(await runIdempotencySequence(c), []);
+  }));
+}
+
+for (const section of ["payload_schema", "payload_schema_unicode"] as const) {
+  for (const c of nodeSections[section].cases) {
+    test(`conformance ${section}: ${c.name}`, () => runCase(section, c.name, () => {
+      const verdict = validateSchema(nodeSections[section].schema, c.data) === null;
+      assert.equal(verdict, c.valid, c.name);
+    }));
+  }
+}
+
+// --- Sections for bindings this package does not carry (ADR-0032 section 2) -----------
+// `delay` (sqs), `backoff` (kafka) and `redis_layout` (redis) are absent from results.json:
+// the schema forbids a section of a binding missing from `bindings`. The transports live in
+// the node-adapters repository, which publishes its own results. Unknown sections are never run.
+
+test("conformance results: every in-scope section is run, every case reports once", () => {
+  assert.deepEqual(bindings, ["otel"], "this package carries the otel binding only");
+  for (const name of inScopeSections()) {
+    const expected = expectedCaseIds(name).sort();
+    const recorded = Object.keys(results[name] ?? {}).sort();
+    assert.deepEqual(recorded, expected, `section ${name}`);
+  }
+  for (const name of ["delay", "backoff", "redis_layout", "redis", "rabbitmq"]) {
+    assert.equal(results[name], undefined, `section ${name} belongs to a binding this package does not carry`);
+  }
+});
+
+test("trim: ASCII whitespace is cut, U+00A0 / U+2003 / U+3000 are kept (ADR-0032 section 5)", () => {
+  for (const space of [" ", " ", "　"]) {
+    const env = EnvelopeCodec.make(`${space}urn:acme:a${space}`, {}, { traceId: `${space}trace-1${space}` });
+    assert.equal(env.job, `${space}urn:acme:a${space}`);
+    assert.equal(env.trace_id, `${space}trace-1${space}`);
+    assert.equal(EnvelopeCodec.urn({ job: `${space}urn:acme:a${space}` }), `${space}urn:acme:a${space}`);
+    assert.equal(EnvelopeCodec.accepts({ ...env, trace_id: space }), true, "a Unicode space is not a blank trace_id");
+  }
+  const env = EnvelopeCodec.make(" \t urn:acme:a \n ", {});
+  assert.equal(env.job, " urn:acme:a ");
+  assert.equal(EnvelopeCodec.urn({ job: "  x  " }), " x ");
+});
+
+test("trim: a very long whitespace run is trimmed in linear time (no regex backtracking)", () => {
+  // `"a" + n spaces + "a"` made the former edge-anchored regex quadratic (160k spaces took ~16 s).
+  const run = " ".repeat(200_000);
+  const started = process.hrtime.bigint();
+  const env = EnvelopeCodec.make(`urn:acme:a${run}b`, {}, { traceId: `a${run}a` });
+  assert.equal(env.trace_id, `a${run}a`);
+  assert.equal(EnvelopeCodec.urn({ job: `${run}x${run}` }), "x");
+  assert.equal(EnvelopeCodec.accepts({ ...env, trace_id: `a${run}a` }), true);
+  assert.equal(EnvelopeCodec.accepts({ ...env, trace_id: run }), false);
+  assert.equal(EnvelopeCodec.make(`${run}urn:acme:a${run}`, {}).job, "urn:acme:a");
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(elapsedMs < 1000, `whitespace handling took ${elapsedMs.toFixed(0)} ms for a 200k run`);
+});
 
 // --- The runner itself: synthetic cases prove each optional field is evaluated -----
 
@@ -555,6 +1011,16 @@ test("forbidden keys: the default warning path uses process.emitWarning, once pe
   assert.equal((hits[0] as Error & { code?: string }).code, FORBIDDEN_KEY_WARNING_CODE);
 });
 
+test("decode: the default warning for a non-string job carries its own code", async () => {
+  const base = JSON.parse(canonicalBody) as Record<string, unknown>;
+  const seen = await captureProcessWarnings(() => {
+    EnvelopeCodec.decode(JSON.stringify({ ...base, job: 5, urn: "urn:acme:b" }));
+  });
+  const hits = seen.filter((w) => w.message.includes("not a string"));
+  assert.equal(hits.length, 1, "a process warning for the non-string job must be emitted once");
+  assert.equal((hits[0] as Error & { code?: string }).code, NON_STRING_JOB_WARNING_CODE);
+});
+
 test("forbidden keys: an explicit onWarning sees every occurrence", () => {
   const warnings: string[] = [];
   for (let i = 0; i < 3; i += 1) {
@@ -603,16 +1069,23 @@ test("decode: a urn that cannot stand in for a missing job is dropped with a war
   }
 });
 
-test("decode: a non-string job keeps winning over urn, and urn is dropped with a warning", () => {
+test("decode: a non-string job is ignored with a warning and urn takes over (ADR-0032 section 6)", () => {
   const base = JSON.parse(canonicalBody) as Record<string, unknown>;
-  const warnings: string[] = [];
-  const env = EnvelopeCodec.decode(JSON.stringify({ ...base, job: 5, urn: "urn:acme:b" }), {
-    onWarning: (m) => warnings.push(m),
-  });
-  assert.equal((env as unknown as Record<string, unknown>).job, 5);
-  assert.ok(!("urn" in env));
-  assert.ok(warnings.some((w) => w.includes("/urn")));
-  assert.doesNotThrow(() => EnvelopeCodec.encode(env as Envelope));
+  for (const job of [5, null, true, {}, []]) {
+    const warnings: string[] = [];
+    const env = EnvelopeCodec.decode(JSON.stringify({ ...base, job, urn: "urn:acme:b" }), {
+      onWarning: (m) => warnings.push(m),
+    });
+    assert.equal(env.job, "urn:acme:b", JSON.stringify(job));
+    assert.ok(!("urn" in env));
+    assert.ok(warnings.some((w) => w.startsWith("BabelQueue:") && w.includes("not a string")), JSON.stringify(job));
+    assert.ok(EnvelopeCodec.accepts(env));
+    assert.doesNotThrow(() => EnvelopeCodec.encode(env as Envelope));
+  }
+  // Neither a valid job nor a valid urn: no identity, so the message is not accepted.
+  const none = EnvelopeCodec.decode(JSON.stringify({ ...base, job: 5, urn: 7 }), { onWarning: () => undefined });
+  assert.equal(EnvelopeCodec.urn(none), "");
+  assert.ok(!EnvelopeCodec.accepts(none));
 });
 
 test("encode: the deprecated options argument is still accepted and its onWarning is never called", () => {

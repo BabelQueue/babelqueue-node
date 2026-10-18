@@ -1,0 +1,13 @@
+{
+  "redis": "redis",
+  "amqp": "amqp",
+  "rabbitmq": "amqp",
+  "sqs": "sqs",
+  "asb": "asb",
+  "azureservicebus": "asb",
+  "azure-service-bus": "asb",
+  "pulsar": "pulsar",
+  "kafka": "kafka",
+  "artemis": "artemis",
+  "otel": "otel"
+}

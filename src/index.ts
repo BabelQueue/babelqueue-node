@@ -17,6 +17,7 @@
 export {
   EnvelopeCodec,
   FORBIDDEN_KEY_WARNING_CODE,
+  NON_STRING_JOB_WARNING_CODE,
   SCHEMA_VERSION,
   SOURCE_LANG,
 } from "./codec.js";

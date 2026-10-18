@@ -28,8 +28,19 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test
+      - name: Test (writes results.json)
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ github.workspace }}/results.json
         run: npm test
+
+      - name: Validate results.json against the schema
+        run: |
+          pipx run check-jsonschema==0.33.0 \
+            --schemafile test/conformance/schema/results.schema.json \
+            results.json
+
+      - name: Fail on missing bindings, missing sections or failing cases
+        run: node scripts/check-conformance-results.cjs results.json test/conformance/manifest.json package.json src
 
       - name: Publish to npm
         run: npm publish --provenance --access public
@@ -40,3 +51,4 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          files: results.json

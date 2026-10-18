@@ -9,6 +9,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- Decode: a non-string `job` (`null`, number, boolean, object, array) is now ignored with a warning
+  and a valid string `urn` takes over; with neither, the message is not accepted (ADR-0032 §6). The
+  default-channel warning starts with `BabelQueue:` and carries its own code,
+  `NON_STRING_JOB_WARNING_CODE` (`"BABELQUEUE_NON_STRING_JOB"`), now exported.
+- Trim and blank checks in `make`, `accepts` and `urn` use the closed ASCII set (space, `\t`, `\n`,
+  `\v`, `\f`, `\r`) in linear time; Unicode whitespace is no longer trimmed (ADR-0032).
+
+### Added
+- Conformance runner covers the v1.5.0 sections (`trim`, `job_type`, `traceparent`) and writes a
+  `results.json` (ADR-0032 §2), validated in CI and before publish.
+
 ## [1.11.0] - 2026-10-17
 
 Implements ADR-0031 (producer `meta` extension keys); conformance suite v1.4.0. The envelope stays at `schema_version: 1`.

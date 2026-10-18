@@ -96,7 +96,8 @@ export interface DecodeOptions {
    * (message-envelope.md §10) and per `urn` alias dropped because `job` is present
    * (ADR-0031 (c)). The message always names the key as an RFC 6901
    * pointer (e.g. `/meta/max_retries`, `/urn`). Called for every occurrence. Defaults to
-   * `process.emitWarning` with the code {@link FORBIDDEN_KEY_WARNING_CODE}, emitted
+   * `process.emitWarning` with the code {@link FORBIDDEN_KEY_WARNING_CODE} (or
+   * {@link NON_STRING_JOB_WARNING_CODE} for an ignored non-string `job`), emitted
    * once per key per process so a high-volume legacy producer cannot flood stderr.
    */
   onWarning?: (message: string) => void;
@@ -117,6 +118,9 @@ export interface EncodeOptions {
 /** The `process.emitWarning` code used for keys dropped on decode. */
 export const FORBIDDEN_KEY_WARNING_CODE = "BABELQUEUE_FORBIDDEN_KEY";
 
+/** The `process.emitWarning` code used when a non-string `job` is ignored on decode (ADR-0032 section 6). */
+export const NON_STRING_JOB_WARNING_CODE = "BABELQUEUE_NON_STRING_JOB";
+
 /** Non-canonical top-level keys (message-envelope.md §10). */
 const FORBIDDEN_TOP_LEVEL_KEYS = ["timestamp"] as const;
 
@@ -126,11 +130,11 @@ const FORBIDDEN_META_KEYS = ["max_retries", "attempts", "source", "ts"] as const
 /** Default-channel warnings already emitted in this process (one per key and direction). */
 const emittedWarnings = new Set<string>();
 
-function defaultWarning(message: string): void {
+function defaultWarning(message: string, code: string = FORBIDDEN_KEY_WARNING_CODE): void {
   if (emittedWarnings.has(message)) return;
   emittedWarnings.add(message);
   if (typeof process !== "undefined" && typeof process.emitWarning === "function") {
-    process.emitWarning(message, { code: FORBIDDEN_KEY_WARNING_CODE });
+    process.emitWarning(message, { code });
   }
 }
 
@@ -165,12 +169,36 @@ function stripForbiddenKeys<T extends object>(
 /** The core `meta` keys a producer can never override (message-envelope.md section 3). */
 const CORE_META_KEYS = ["id", "queue", "lang", "schema_version", "created_at"] as const;
 
-/** The closed ASCII whitespace set of ADR-0031 (c): space, \t, \n, \v, \f, \r. Never `trim()`, which also cuts Unicode spaces. */
-const ASCII_BLANK = /^[ \t\n\v\f\r]*$/;
-const ASCII_EDGE_WHITESPACE = /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g;
+/** Whether one UTF-16 code unit is in the closed ASCII whitespace set of ADR-0031 (c): space, \t, \n, \v, \f, \r. */
+function isAsciiWhitespaceCode(code: number): boolean {
+  return code === 0x20 || (code >= 0x09 && code <= 0x0d);
+}
 
+/**
+ * Cuts surrounding ASCII whitespace only (ADR-0032 section 5); U+00A0, U+2003 and U+3000 stay part of
+ * the value. Never `trim()`, which also cuts Unicode spaces. A two-ended index scan: linear in the
+ * input, unlike an edge-anchored regex, which backtracks quadratically on long whitespace runs.
+ */
+function trimAscii(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && isAsciiWhitespaceCode(value.charCodeAt(start))) {
+    start++;
+  }
+  while (end > start && isAsciiWhitespaceCode(value.charCodeAt(end - 1))) {
+    end--;
+  }
+  return start === 0 && end === value.length ? value : value.slice(start, end);
+}
+
+/** Whether the value is empty or only ASCII whitespace (same closed set as {@link trimAscii}). */
 function isAsciiBlank(value: string): boolean {
-  return ASCII_BLANK.test(value);
+  for (let i = 0; i < value.length; i++) {
+    if (!isAsciiWhitespaceCode(value.charCodeAt(i))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function hasOwn(record: object, key: string): boolean {
@@ -218,6 +246,10 @@ function checkProducerMeta(meta: Record<string, unknown>): Record<string, unknow
   return { ...meta };
 }
 
+function nonStringJobMessage(): string {
+  return "BabelQueue: ignoring /job: it is not a string (ADR-0032 section 6); a valid urn alias is used instead, if present.";
+}
+
 function forbiddenKeyMessage(pointer: string): string {
   return `BabelQueue: dropped non-canonical envelope key ${pointer} (message-envelope.md §10); it is never re-emitted.`;
 }
@@ -243,14 +275,14 @@ export const EnvelopeCodec = {
     data: Record<string, unknown>,
     options: MakeOptions = {},
   ): Envelope {
-    const resolvedUrn = (urn ?? "").trim();
+    const resolvedUrn = trimAscii(urn ?? "");
     if (resolvedUrn === "") {
       throw new BabelQueueError(
         "A polyglot message must expose a stable, non-empty URN so consumers can identify it without any class name.",
       );
     }
 
-    const traceId = (options.traceId ?? "").trim() || randomUUID();
+    const traceId = trimAscii(options.traceId ?? "") || randomUUID();
 
     const extension = options.meta === undefined ? {} : checkProducerMeta(options.meta);
 
@@ -311,7 +343,9 @@ export const EnvelopeCodec = {
    * alias into `job` (ADR-0031 (c)): a missing, empty or ASCII-whitespace-only `job`
    * (space, `\t`, `\n`, `\v`, `\f`, `\r`) counts as absent and the URN is read from `urn`;
    * if `job` is present, `job` wins and a `urn` next to it is dropped with a warning
-   * naming `/urn`. The `urn` key is never kept on the decoded envelope. Unknown keys are
+   * naming `/urn`. A `job` that is not a string (null, number, boolean, object, array) is
+   * ignored with a warning and the URN is read from a valid `urn` alias (ADR-0032 section 6);
+   * with no valid identity at all the result fails {@link EnvelopeCodec.accepts}. The `urn` key is never kept on the decoded envelope. Unknown keys are
    * kept (forward compatibility); the non-canonical keys of message-envelope.md §10
    * (`timestamp`, `meta.max_retries`, `meta.attempts`, `meta.source`, `meta.ts`) are
    * dropped with a warning — decode still succeeds so older producers keep working.
@@ -329,10 +363,17 @@ export const EnvelopeCodec = {
 
     const warn = options.onWarning ?? defaultWarning;
     const envelope = stripForbiddenKeys(parsed as IncomingEnvelope, warn);
+    // ADR-0032 section 6: a `job` that is not a string (null, number, boolean, object, array)
+    // is ignored with a warning, so a valid `urn` alias can stand in for it.
+    const rawJob: unknown = envelope.job;
+    const jobIsNonString = rawJob !== undefined && typeof rawJob !== "string";
+    if (jobIsNonString) {
+      const warnJob = options.onWarning ?? ((message: string) => defaultWarning(message, NON_STRING_JOB_WARNING_CODE));
+      warnJob(nonStringJobMessage());
+    }
     if (hasOwn(envelope, "urn")) {
-      const job: unknown = envelope.job;
       const jobAbsent =
-        job === undefined || job === null || (typeof job === "string" && isAsciiBlank(job));
+        jobIsNonString || rawJob === undefined || (typeof rawJob === "string" && isAsciiBlank(rawJob));
       if (!jobAbsent) {
         delete envelope.urn;
         warn(forbiddenKeyMessage("/urn"));
@@ -359,7 +400,7 @@ export const EnvelopeCodec = {
     if (typeof value !== "string" || isAsciiBlank(value)) {
       return "";
     }
-    return value.replace(ASCII_EDGE_WHITESPACE, "");
+    return trimAscii(value);
   },
 
   /**
@@ -393,7 +434,7 @@ export const EnvelopeCodec = {
     }
 
     const traceId = envelope.trace_id;
-    if (typeof traceId !== "string" || traceId.trim() === "") {
+    if (typeof traceId !== "string" || isAsciiBlank(traceId)) {
       return false;
     }
 

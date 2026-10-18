@@ -63,16 +63,44 @@ jobs:
   conformance:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
+    env:
+      BQ_CONFORMANCE_VERSION: "1.5.0"
     steps:
       - uses: actions/checkout@v7
-      - name: Verify vendored conformance matches the canonical suite
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Fetch fetch.sh from the pinned conformance tag
         run: |
-          git clone --depth 1 --branch v1.4.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
-          diff -u "$RUNNER_TEMP/conformance/CONFORMANCE_VERSION" "test/conformance/CONFORMANCE_VERSION"
-          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "test/conformance/manifest.json"
-          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "test/conformance/fixtures"
-          diff -ru "$RUNNER_TEMP/conformance/schema"        "test/conformance/schema"
-          echo "Vendored conformance is in sync with the canonical suite."
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/fetch.sh" \
+            "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          chmod +x "$RUNNER_TEMP/fetch.sh"
+
+      - name: Verify vendored conformance matches the release asset
+        run: |
+          # Downloads babelqueue-conformance-<version>.tar.gz, verifies it against SHA256SUMS,
+          # then diffs it with the vendored copy (exit 1 on drift).
+          "$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" test/conformance
+
+      - name: Test (writes results.json)
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+        run: npm test
+
+      - name: Validate results.json against the schema
+        run: |
+          pipx run check-jsonschema==0.33.0 \
+            --schemafile test/conformance/schema/results.schema.json \
+            "$RUNNER_TEMP/results.json"
+
+      - name: Fail on missing bindings, missing sections or failing cases
+        run: node scripts/check-conformance-results.cjs "$RUNNER_TEMP/results.json" test/conformance/manifest.json package.json src
 
   ci-green:
     name: CI green
