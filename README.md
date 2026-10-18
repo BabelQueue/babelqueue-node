@@ -4,6 +4,8 @@
 [![npm](https://img.shields.io/npm/v/@babelqueue/core.svg)](https://www.npmjs.com/package/@babelqueue/core)
 [![node](https://img.shields.io/node/v/@babelqueue/core.svg)](https://www.npmjs.com/package/@babelqueue/core)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Live interop](https://img.shields.io/endpoint?url=https%3A%2F%2Fbabelqueue.com%2Fbadges%2Fnightly.json)](https://babelqueue.com/compatibility/)
+[![BabelQueue conformance](https://img.shields.io/badge/BabelQueue-conformance%20matrix-10B981.svg)](https://babelqueue.com/compatibility/)
 
 > **Polyglot Queues, Simplified.** Read and write the canonical BabelQueue message
 > envelope from Node.js — so your Node services exchange messages with Laravel,
