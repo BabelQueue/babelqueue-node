@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-10-19
+
 ### Changed
 - Decode: a non-string `job` (`null`, number, boolean, object, array) is now ignored with a warning
   and a valid string `urn` takes over; with neither, the message is not accepted (ADR-0032 §6). The
