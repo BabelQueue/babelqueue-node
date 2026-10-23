@@ -9,6 +9,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- `retryBackoffDelay(options, n, random?)` and `retryBackoffBound(options, n)`: the shared retry
+  backoff formula (ADR-0034 §9, Core C5). `d(n) = min(max, base * multiplier^(n-1))` with
+  `n = attempts + 1`; `retryJitter: "full"` draws `uniform(0, d(n))`. Defaults (`retryBackoff` 0,
+  multiplier 1, max 0 = uncapped, jitter `none`) give a zero delay, so nothing changes unless a
+  consumer opts in. Pure helper, no wire change (`schema_version` stays 1).
+- Conformance runner covers the v1.6.0 `retry_backoff` section; the sections that belong to
+  transport packages (`redis_layout`, `redis_delay`, `kafka_poison`, `backoff`) are reported as absent.
+
+### Changed
+- CI pins `fetch.sh` by sha256 (`BQ_FETCH_SH_SHA256`) next to `BQ_CONFORMANCE_VERSION` (now 1.6.0).
+
 ## [1.12.0] - 2026-10-19
 
 ### Changed

@@ -16,6 +16,7 @@ import {
   InvalidEnvelopeKeyError,
   Wrap,
   annotate,
+  retryBackoffDelay,
 } from "../src/index.js";
 import type { Envelope } from "../src/index.js";
 import { remoteParentFromHeaders, traceIdOf } from "../src/otel.js";
@@ -541,6 +542,7 @@ const nodeSections = fullManifest as unknown as {
   trim: { cases: TrimCase[] };
   job_type: { cases: JobTypeCase[] };
   traceparent: { cases: TraceparentCase[] };
+  retry_backoff: { cases: RetryBackoffCase[] };
   idempotency: {
     dedup_key: { envelope_file: string; expected_key: string };
     sequences: { cases: IdempotencyCase[] };
@@ -548,6 +550,17 @@ const nodeSections = fullManifest as unknown as {
   payload_schema: { schema: SchemaNode; cases: PayloadSchemaCase[] };
   payload_schema_unicode: { schema: SchemaNode; cases: PayloadSchemaCase[] };
 };
+
+interface RetryBackoffCase {
+  name: string;
+  retry_backoff: number;
+  retry_backoff_multiplier: number;
+  retry_backoff_max: number;
+  retry_jitter: "none" | "full";
+  n: number;
+  expect_delay_seconds?: number;
+  expect_delay_range_seconds?: { min: number; max: number };
+}
 
 interface TrimCase {
   name: string;
@@ -770,6 +783,32 @@ for (const c of nodeSections.traceparent.cases) {
   }));
 }
 
+// --- retry_backoff (conformance v1.6.0, ADR-0034 section 9) ---------------------------
+
+const BACKOFF_JITTER_DRAWS = 50;
+
+for (const c of nodeSections.retry_backoff.cases) {
+  test(`conformance retry_backoff: ${c.name}`, () => runCase("retry_backoff", c.name, () => {
+    const options = {
+      retryBackoff: c.retry_backoff,
+      retryBackoffMultiplier: c.retry_backoff_multiplier,
+      retryBackoffMax: c.retry_backoff_max,
+      retryJitter: c.retry_jitter,
+    };
+    if (c.retry_jitter === "none") {
+      assert.equal(c.expect_delay_seconds !== undefined, true, `${c.name}: none needs expect_delay_seconds`);
+      assert.equal(retryBackoffDelay(options, c.n), c.expect_delay_seconds);
+      return;
+    }
+    const range = c.expect_delay_range_seconds;
+    assert.ok(range !== undefined, `${c.name}: full jitter needs expect_delay_range_seconds`);
+    for (let draw = 0; draw < BACKOFF_JITTER_DRAWS; draw += 1) {
+      const delay = retryBackoffDelay(options, c.n);
+      assert.ok(delay >= range.min && delay <= range.max, `${c.name}: ${delay} not in [${range.min}, ${range.max}]`);
+    }
+  }));
+}
+
 test("conformance idempotency: dedup_key", () => runCase("idempotency", "dedup_key", () => {
   const key = nodeSections.idempotency.dedup_key;
   const env = EnvelopeCodec.decode(readJson(key.envelope_file));
@@ -792,7 +831,7 @@ for (const section of ["payload_schema", "payload_schema_unicode"] as const) {
 }
 
 // --- Sections for bindings this package does not carry (ADR-0032 section 2) -----------
-// `delay` (sqs), `backoff` (kafka) and `redis_layout` (redis) are absent from results.json:
+// `delay` (sqs), `backoff` and `kafka_poison` (kafka), `redis_layout`, `redis_delay` and `redis` (redis) are absent from results.json:
 // the schema forbids a section of a binding missing from `bindings`. The transports live in
 // the node-adapters repository, which publishes its own results. Unknown sections are never run.
 
@@ -803,7 +842,7 @@ test("conformance results: every in-scope section is run, every case reports onc
     const recorded = Object.keys(results[name] ?? {}).sort();
     assert.deepEqual(recorded, expected, `section ${name}`);
   }
-  for (const name of ["delay", "backoff", "redis_layout", "redis", "rabbitmq"]) {
+  for (const name of ["delay", "backoff", "kafka_poison", "redis_layout", "redis_delay", "redis", "rabbitmq"]) {
     assert.equal(results[name], undefined, `section ${name} belongs to a binding this package does not carry`);
   }
 });

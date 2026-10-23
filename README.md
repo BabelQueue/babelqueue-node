@@ -246,6 +246,24 @@ future thin adapter), exactly as with the other SDK cores.
 `UnknownUrnStrategy` (`FAIL`, `DELETE`, `RELEASE`, `DEAD_LETTER`) is provided for
 adapters to act on.
 
+## Retry backoff
+
+`retryBackoffDelay(options, n)` is the shared retry-delay formula adapters use between attempts
+(`n = attempts + 1`). It is opt-in: with no options the delay is `0`.
+
+```ts
+import { retryBackoffDelay } from "@babelqueue/core";
+
+// 5 s, 10 s, 20 s, 40 s, capped at 60 s
+retryBackoffDelay({ retryBackoff: 5, retryBackoffMultiplier: 2, retryBackoffMax: 60 }, 3); // 20
+
+// uniform(0, d(n)) when you want jitter
+retryBackoffDelay({ retryBackoff: 5, retryBackoffMultiplier: 2, retryJitter: "full" }, 3);
+```
+
+`d(n) = min(max, base * multiplier^(n-1))`; `retryBackoffMax: 0` means uncapped. Transport limits
+(for example SQS's 12 h visibility ceiling) still apply on top. It does not touch the envelope.
+
 ## Conformance
 
 This core passes the shared **cross-SDK conformance suite** (vendored under
