@@ -15,10 +15,16 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `n = attempts + 1`; `retryJitter: "full"` draws `uniform(0, d(n))`. Defaults (`retryBackoff` 0,
   multiplier 1, max 0 = uncapped, jitter `none`) give a zero delay, so nothing changes unless a
   consumer opts in. Pure helper, no wire change (`schema_version` stays 1).
+- `buildPoisonRecord(body, deadLetterJson)`: the DLQ record of a poison body per ADR-0035. A strict
+  JSON object without a top-level `dead_letter` is spliced at byte level (no value is re-encoded);
+  anything else is wrapped as `{"raw", "raw_encoding"?, "dead_letter"}`, with invalid UTF-8 written as
+  base64 plus `"raw_encoding": "base64"` (never U+FFFD). Pure helper, no wire change. The conformance
+  runner covers the v1.6.0 `poison_dlq` section with it.
 - Conformance runner covers the v1.6.0 `retry_backoff` section; the sections that belong to
   transport packages (`redis_layout`, `redis_delay`, `kafka_poison`, `backoff`) are reported as absent.
 
 ### Changed
+- `buildPoisonRecord` / `poisonRecord()`: the `dead_letter` argument is now validated as a single JSON object and rejected otherwise. (`TypeError`); removed the unused `isLossyNumberToken`.
 - CI pins `fetch.sh` by sha256 (`BQ_FETCH_SH_SHA256`) next to `BQ_CONFORMANCE_VERSION` (now 1.6.0).
 
 ## [1.12.0] - 2026-10-19

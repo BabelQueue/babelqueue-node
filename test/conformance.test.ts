@@ -16,6 +16,7 @@ import {
   InvalidEnvelopeKeyError,
   Wrap,
   annotate,
+  buildPoisonRecord,
   retryBackoffDelay,
 } from "../src/index.js";
 import type { Envelope } from "../src/index.js";
@@ -538,11 +539,24 @@ for (const c of behaviour.encode_reject?.cases ?? []) {
 
 // --- trim, job_type, traceparent (conformance v1.5.0, ADR-0032 / ADR-0028) -----------
 
+interface PoisonDlqCase {
+  name: string;
+  body?: string;
+  body_base64?: string;
+  expect: {
+    shape: "splice" | "wrapper" | "splice_or_wrapper";
+    record: Record<string, unknown>;
+    splice_literals?: string[];
+    splice_keys?: string[];
+  };
+}
+
 const nodeSections = fullManifest as unknown as {
   trim: { cases: TrimCase[] };
   job_type: { cases: JobTypeCase[] };
   traceparent: { cases: TraceparentCase[] };
   retry_backoff: { cases: RetryBackoffCase[] };
+  poison_dlq: { original_queue: string; cases: PoisonDlqCase[] };
   idempotency: {
     dedup_key: { envelope_file: string; expected_key: string };
     sequences: { cases: IdempotencyCase[] };
@@ -806,6 +820,76 @@ for (const c of nodeSections.retry_backoff.cases) {
       const delay = retryBackoffDelay(options, c.n);
       assert.ok(delay >= range.min && delay <= range.max, `${c.name}: ${delay} not in [${range.min}, ${range.max}]`);
     }
+  }));
+}
+
+// --- poison_dlq: the DLQ record shape of a poison body (conformance v1.6.0, ADR-0035) -----
+
+/** Distinct top-level member names of a JSON object text (a repeated name counts once). */
+function topLevelNames(text: string): string[] {
+  const names = new Set<string>();
+  let depth = 0;
+  let expectKey = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === "{" || c === "[") {
+      depth++;
+      expectKey = c === "{" && depth === 1;
+    } else if (c === "}" || c === "]") {
+      depth--;
+    } else if (c === ",") {
+      expectKey = depth === 1;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      if (depth === 1 && expectKey) {
+        names.add(JSON.parse(text.slice(i, j + 1)) as string);
+        expectKey = false;
+      }
+      i = j;
+    }
+  }
+  return [...names];
+}
+
+for (const c of nodeSections.poison_dlq.cases) {
+  test(`conformance poison_dlq: ${c.name}`, () => runCase("poison_dlq", c.name, () => {
+    const body = c.body_base64 !== undefined ? Buffer.from(c.body_base64, "base64") : Buffer.from(c.body ?? "", "utf8");
+    const deadLetter = {
+      reason: "poison",
+      error: "e",
+      exception: "BabelQueueError",
+      failed_at: 1,
+      original_queue: nodeSections.poison_dlq.original_queue,
+      attempts: 0,
+      lang: "node",
+    };
+    const record = buildPoisonRecord(body, JSON.stringify(deadLetter));
+
+    const parsed = JSON.parse(record) as Record<string, unknown>;
+    assert.deepEqual(parsed.dead_letter, deadLetter, c.name);
+    const rest = { ...parsed };
+    delete rest.dead_letter;
+    const { shape, record: expected } = c.expect;
+    if (shape === "wrapper" || (shape === "splice_or_wrapper" && "raw" in rest)) {
+      assert.deepEqual(rest, expected, c.name);
+      return;
+    }
+    // splice: the record is the original bytes plus the dead_letter member
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+    assert.equal("raw" in parsed || "raw_encoding" in parsed, false, c.name);
+    if (shape === "splice") assert.deepEqual(rest, expected, c.name);
+    for (const literal of c.expect.splice_literals ?? []) {
+      assert.ok(record.includes(literal), `${c.name}: missing literal ${literal}`);
+    }
+    if (c.expect.splice_keys !== undefined) {
+      assert.deepEqual(
+        topLevelNames(record).filter((k) => k !== "dead_letter").sort(),
+        [...c.expect.splice_keys].sort(),
+        c.name,
+      );
+    }
+    assert.ok(record.startsWith(text.trim().slice(0, -1).trimEnd()), c.name);
   }));
 }
 
