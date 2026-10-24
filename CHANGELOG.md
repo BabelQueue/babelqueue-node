@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-10-24
+
 ### Added
 - `retryBackoffDelay(options, n, random?)` and `retryBackoffBound(options, n)`: the shared retry
   backoff formula (ADR-0034 §9). `d(n) = min(max, base * multiplier^(n-1))` with
