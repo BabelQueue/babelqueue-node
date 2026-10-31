@@ -38,6 +38,8 @@ export type { RetryBackoffOptions, RetryJitter } from "./backoff.js";
 
 export { buildPoisonRecord } from "./poisonRecord.js";
 
+export type { DeadLetterEvent, DeadLetterObserver } from "./deadLetterObserver.js";
+
 export { annotate } from "./deadLetter.js";
 export type { AnnotateOptions } from "./deadLetter.js";
 export * as deadLetter from "./deadLetter.js";

@@ -1,11 +1,23 @@
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
-import { trace } from "@opentelemetry/api";
+import {
+  SpanKind,
+  SpanStatusCode,
+  trace,
+  type Attributes,
+  type Counter,
+  type Histogram,
+  type Meter,
+  type MetricOptions,
+  type Tracer,
+} from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 
 import {
   BabelQueueError,
@@ -20,7 +32,8 @@ import {
   retryBackoffDelay,
 } from "../src/index.js";
 import type { Envelope } from "../src/index.js";
-import { remoteParentFromHeaders, traceIdOf } from "../src/otel.js";
+import { createDeadLetterObserver, publish, remoteParentFromHeaders, traceIdOf, wrapHandler } from "../src/otel.js";
+import type { PublishOptions } from "../src/otel.js";
 import { validateSchema } from "../src/schema.js";
 import type { SchemaNode } from "../src/schema.js";
 
@@ -914,14 +927,508 @@ for (const section of ["payload_schema", "payload_schema_unicode"] as const) {
   }
 }
 
+// --- otel: span-shape, trace-id, metrics (conformance v1.9.0, ADR-0038 / ADR-0039) -------------
+
+interface SpanShapeCase {
+  name: string;
+  mode: "span";
+  operation: "send" | "process";
+  system?: string;
+  queue?: string;
+  urn: string;
+  consumer_group?: string;
+  trace_id?: string;
+  message_id?: string;
+  attempts?: number;
+  schema_version?: number;
+  outcome: "ok" | "error";
+  envelope_built?: boolean;
+  expect: {
+    span_name?: string;
+    span_name_one_of?: string[];
+    span_kind: "PRODUCER" | "CONSUMER";
+    status: "unset" | "error";
+    error_type?: "present";
+    attributes: Record<string, string | number>;
+    optional_attributes?: string[];
+  };
+}
+
+interface TraceIdCase {
+  name: string;
+  mode: "map" | "decode" | "reemit" | "downstream" | "make";
+  trace_id: string;
+  urn?: string;
+  expect: { trace_id_hex?: string; mapping?: "decode" | "hash"; trace_id?: string; decoded?: boolean };
+}
+
+interface MetricRecord {
+  metric: string;
+  kind: "add" | "record";
+  value: number | "non_negative_seconds";
+  attributes: Record<string, string>;
+  error_type?: "present";
+}
+
+interface MetricsCase {
+  name: string;
+  mode: "instrument" | "consume" | "publish" | "dead_letter";
+  system?: string;
+  queue?: string;
+  attempts?: number;
+  outcome?: "ok" | "error";
+  meter?: boolean;
+  observer_called?: boolean;
+  event?: { queue: string; dead_letter_queue: string; reason: string };
+  expect: {
+    records?: MetricRecord[];
+    metric?: string;
+    instrument?: "histogram" | "counter";
+    unit?: string;
+    operation_name?: string;
+    attributes?: { always: string[]; when_destination_known: string[]; on_failure?: string[] };
+    forbidden_attributes?: string[];
+    advisory_bucket_boundaries?: number[];
+  };
+}
+
+const otelSections = fullManifest as unknown as {
+  "span-shape": { cases: SpanShapeCase[] };
+  "trace-id": { cases: TraceIdCase[] };
+  metrics: { cases: MetricsCase[] };
+};
+
+/** The ADR-0038 section 4 attribute keys: a key the case does not list must be absent from the span. */
+const SPAN_TABLE_KEYS = [
+  "messaging.system",
+  "messaging.operation.type",
+  "messaging.operation.name",
+  "messaging.destination.name",
+  "messaging.message.id",
+  "messaging.message.conversation_id",
+  "messaging.consumer.group.name",
+  "babelqueue.urn",
+  "babelqueue.schema_version",
+  "babelqueue.attempts",
+  "error.type",
+  "messaging.operation",
+  "messaging.babelqueue.attempts",
+];
+
+const isBlankAscii = (value: string): boolean => /^[ \t\n\v\f\r]*$/.test(value);
+
+function spanRecorder(): { tracer: Tracer; exporter: InMemorySpanExporter } {
+  const exporter = new InMemorySpanExporter();
+  const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+  return { tracer: provider.getTracer("conformance"), exporter };
+}
+
+/** Drives the producer or consumer wrapper for one span-shape case and compares the finished span. */
+async function runSpanShape(c: SpanShapeCase): Promise<string[]> {
+  const { tracer, exporter } = spanRecorder();
+  let produced: Envelope | undefined;
+
+  if (c.operation === "send") {
+    const options: PublishOptions = {};
+    if (c.system !== undefined) options.system = c.system;
+    if (c.queue !== undefined) options.queue = c.queue;
+    if (c.envelope_built === false) {
+      // make() rejects a caller meta key that collides with a core one, so no envelope is ever built.
+      options.meta = { id: "collides" };
+    }
+    try {
+      await publish(
+        tracer,
+        c.urn,
+        {},
+        (envelope) => {
+          produced = envelope;
+          if (c.outcome === "error") {
+            throw new Error("transport down");
+          }
+        },
+        options,
+      );
+    } catch {
+      // the failure is the case input; the span carries it
+    }
+  } else {
+    const envelope = EnvelopeCodec.make(c.urn, {}, { queue: "placeholder" });
+    envelope.trace_id = c.trace_id ?? envelope.trace_id;
+    envelope.attempts = c.attempts ?? 0;
+    envelope.meta.schema_version = c.schema_version ?? 1;
+    const meta = envelope.meta as unknown as Record<string, unknown>;
+    if (c.queue === undefined) delete meta.queue;
+    else meta.queue = c.queue;
+    if (c.message_id === undefined) delete meta.id;
+    else meta.id = c.message_id;
+    const options: { system?: string; consumerGroup?: string } = {};
+    if (c.system !== undefined) options.system = c.system;
+    if (c.consumer_group !== undefined) options.consumerGroup = c.consumer_group;
+    const handle = wrapHandler(
+      tracer,
+      () => {
+        if (c.outcome === "error") {
+          throw new Error("handler failed");
+        }
+      },
+      undefined,
+      options,
+    );
+    try {
+      await handle(envelope);
+    } catch {
+      // as above
+    }
+  }
+
+  const spans = exporter.getFinishedSpans();
+  if (spans.length !== 1) {
+    return [`expected exactly one span, got ${String(spans.length)}`];
+  }
+  const span = spans[0]!;
+  const violations: string[] = [];
+
+  // Placeholders of a `send` case come from the envelope handed to the transport (ADR-0038 / v1.9.0 runner rule).
+  const producedQueue = produced?.meta.queue ?? "";
+  const queueKnown = !isBlankAscii(producedQueue);
+  const substitute = (value: string | number): string | number | undefined => {
+    if (typeof value !== "string") return value;
+    switch (value) {
+      case "$produced.meta.id":
+        return produced?.meta.id;
+      case "$produced.trace_id":
+        return produced?.trace_id;
+      case "$produced.meta.queue":
+        return queueKnown ? producedQueue : undefined;
+      default:
+        return value;
+    }
+  };
+
+  const expectedAttributes: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(c.expect.attributes)) {
+    const resolved = substitute(value);
+    if (resolved !== undefined) expectedAttributes[key] = resolved;
+    else if (typeof value === "string" && value.startsWith("$produced.meta.queue") === false) {
+      violations.push(`placeholder ${value} of ${key} could not be resolved (no envelope reached the transport)`);
+    }
+  }
+  const optional = new Set(c.expect.optional_attributes ?? []);
+
+  if (c.expect.span_name !== undefined) {
+    const expectedName = c.expect.span_name.replace(" $produced.meta.queue", queueKnown ? ` ${producedQueue}` : "");
+    if (span.name !== expectedName) violations.push(`span name ${JSON.stringify(span.name)}, expected ${JSON.stringify(expectedName)}`);
+  } else if (!(c.expect.span_name_one_of ?? []).includes(span.name)) {
+    violations.push(`span name ${JSON.stringify(span.name)} is not one of ${JSON.stringify(c.expect.span_name_one_of)}`);
+  }
+  if (span.kind !== SpanKind[c.expect.span_kind]) violations.push(`span kind ${String(span.kind)}`);
+  const expectedStatus = c.expect.status === "error" ? SpanStatusCode.ERROR : SpanStatusCode.UNSET;
+  if (span.status.code !== expectedStatus) violations.push(`status ${String(span.status.code)}`);
+
+  for (const [key, value] of Object.entries(expectedAttributes)) {
+    if (span.attributes[key] !== value) {
+      violations.push(`${key} is ${JSON.stringify(span.attributes[key])}, expected ${JSON.stringify(value)}`);
+    }
+  }
+  for (const key of SPAN_TABLE_KEYS) {
+    if (key in expectedAttributes || optional.has(key)) continue;
+    if (key === "error.type") continue; // handled below
+    if (key in span.attributes) violations.push(`${key} must not be on the span`);
+  }
+  for (const key of Object.keys(span.attributes)) {
+    if (key.startsWith("babelqueue.") && !SPAN_TABLE_KEYS.includes(key)) violations.push(`${key} is not a table key`);
+  }
+  const errorType = span.attributes["error.type"];
+  if (c.expect.error_type === "present") {
+    if (typeof errorType !== "string" || errorType === "") violations.push("error.type must be a non-empty string");
+  } else if (errorType !== undefined) {
+    violations.push("error.type must not be on a successful span");
+  }
+  for (const key of optional) {
+    if (key in span.attributes) {
+      const given = c.queue ?? "";
+      if (span.attributes[key] !== given) violations.push(`optional ${key} must equal the queue given (${JSON.stringify(given)})`);
+      if (span.name !== `${c.operation} ${given}`) violations.push("span name must agree with the optional destination");
+    } else if (span.name !== c.operation) {
+      violations.push("span name must be the bare operation name when the destination is absent");
+    }
+  }
+  if (c.expect.error_type === "present" && !span.events.some((e) => e.name === "exception")) {
+    violations.push("the error must be recorded as an exception event");
+  }
+  return violations;
+}
+
+for (const c of otelSections["span-shape"].cases) {
+  test(`conformance span-shape: ${c.name}`, () => runCase("span-shape", c.name, async () => {
+    assert.deepEqual(await runSpanShape(c), []);
+  }));
+}
+
+/** The lower-case hex bytes of the hash mapping: SHA-256 of the UTF-8 bytes, first 16 bytes. */
+const hashHex = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex").slice(0, 32);
+
+function runTraceId(c: TraceIdCase): string[] {
+  const violations: string[] = [];
+  const expectTraceId = (actual: unknown): void => {
+    if (actual !== c.expect.trace_id) {
+      violations.push(`trace_id is ${JSON.stringify(actual)}, expected ${JSON.stringify(c.expect.trace_id)}`);
+    }
+  };
+  switch (c.mode) {
+    case "map": {
+      const hex = traceIdOf(c.trace_id);
+      if (hex !== c.expect.trace_id_hex) violations.push(`mapping gave ${hex}, expected ${String(c.expect.trace_id_hex)}`);
+      const viaDecode = c.trace_id.replace(/-/g, "").toLowerCase();
+      const reference = c.expect.mapping === "decode" ? viaDecode : hashHex(c.trace_id);
+      if (hex !== reference) violations.push(`mapping is not the ${String(c.expect.mapping)} of the value`);
+      break;
+    }
+    case "decode": {
+      const body = JSON.stringify({ ...EnvelopeCodec.make("urn:acme:a", {}), trace_id: c.trace_id });
+      const { env } = decodeCollectingWarnings(body);
+      if (c.expect.decoded !== true || Object.keys(env).length === 0) violations.push("decode must succeed");
+      expectTraceId(env.trace_id);
+      break;
+    }
+    case "reemit": {
+      const body = JSON.stringify({ ...EnvelopeCodec.make("urn:acme:a", {}), trace_id: c.trace_id });
+      const { env } = decodeCollectingWarnings(body);
+      const hop = env as Envelope;
+      hop.attempts += 1;
+      expectTraceId((JSON.parse(EnvelopeCodec.encode(hop)) as { trace_id: unknown }).trace_id);
+      break;
+    }
+    case "downstream": {
+      expectTraceId(EnvelopeCodec.make("urn:acme:next", {}, { traceId: c.trace_id }).trace_id);
+      break;
+    }
+    case "make": {
+      const made = EnvelopeCodec.make(c.urn ?? "urn:acme:a", {}, { traceId: c.trace_id });
+      expectTraceId(made.trace_id);
+      if (traceIdOf(made.trace_id) !== c.expect.trace_id_hex) violations.push("OTel mapping of the stored value differs");
+      break;
+    }
+  }
+  return violations;
+}
+
+for (const c of otelSections["trace-id"].cases) {
+  test(`conformance trace-id: ${c.name}`, () => runCase("trace-id", c.name, () => {
+    assert.deepEqual(runTraceId(c), []);
+  }));
+}
+
+interface RecordedPoint {
+  metric: string;
+  kind: "add" | "record";
+  value: number;
+  attributes: Attributes;
+}
+
+interface CreatedInstrument {
+  name: string;
+  kind: "histogram" | "counter";
+  options?: MetricOptions;
+}
+
+/** An in-memory metric reader: every instrument call lands in `points`, every creation in `created`. */
+function inMemoryMeter(): { meter: Meter; points: RecordedPoint[]; created: CreatedInstrument[] } {
+  const points: RecordedPoint[] = [];
+  const created: CreatedInstrument[] = [];
+  const meter = {
+    createCounter(name: string, options?: MetricOptions): Counter {
+      created.push({ name, kind: "counter", options });
+      return { add: (value: number, attributes: Attributes = {}) => void points.push({ metric: name, kind: "add", value, attributes }) };
+    },
+    createHistogram(name: string, options?: MetricOptions): Histogram {
+      created.push({ name, kind: "histogram", options });
+      return { record: (value: number, attributes: Attributes = {}) => void points.push({ metric: name, kind: "record", value, attributes }) };
+    },
+  } as unknown as Meter;
+  return { meter, points, created };
+}
+
+/** A recorded point or an expected record in one comparable form (ADR-0039: multiset of data points). */
+function canonicalRecord(
+  metric: string,
+  kind: string,
+  value: number | "non_negative_seconds",
+  attributes: Record<string, unknown>,
+  expectErrorType: boolean,
+  actual: boolean,
+): string {
+  const attrs: Record<string, unknown> = { ...attributes };
+  if (actual) {
+    const errorType = attrs["error.type"];
+    if (errorType !== undefined) {
+      attrs["error.type"] = typeof errorType === "string" && errorType !== "" ? "<present>" : "<invalid>";
+    }
+  } else if (expectErrorType) {
+    attrs["error.type"] = "<present>";
+  }
+  const shownValue =
+    kind === "record"
+      ? value === "non_negative_seconds" || (typeof value === "number" && Number.isFinite(value) && value >= 0)
+        ? "<seconds>"
+        : "<invalid>"
+      : value === "non_negative_seconds"
+        ? "<invalid>"
+        : value;
+  const sorted = Object.fromEntries(Object.entries(attrs).sort(([a], [b]) => (a < b ? -1 : 1)));
+  return JSON.stringify({ metric, kind, value: shownValue, attributes: sorted });
+}
+
+function compareRecords(points: RecordedPoint[], expected: MetricRecord[], producedQueue?: string): string[] {
+  const queueKnown = producedQueue !== undefined && !isBlankAscii(producedQueue);
+  const wanted = expected.map((r) => {
+    const attributes: Record<string, string> = {};
+    for (const [key, value] of Object.entries(r.attributes)) {
+      if (value === "$produced.meta.queue") {
+        if (queueKnown) attributes[key] = producedQueue;
+      } else {
+        attributes[key] = value;
+      }
+    }
+    return canonicalRecord(r.metric, r.kind, r.value, attributes, r.error_type === "present", false);
+  });
+  const got = points.map((p) => canonicalRecord(p.metric, p.kind, p.value, p.attributes, false, true));
+  const missing = wanted.filter((w) => !got.includes(w));
+  const extra = got.filter((g) => !wanted.includes(g));
+  const violations = [...missing.map((m) => `missing ${m}`), ...extra.map((g) => `unexpected ${g}`)];
+  if (violations.length === 0 && got.length !== wanted.length) violations.push(`expected ${String(wanted.length)} points, got ${String(got.length)}`);
+  return violations;
+}
+
+async function runMetricsScenario(c: MetricsCase): Promise<string[]> {
+  const { tracer } = spanRecorder();
+  const { meter, points } = inMemoryMeter();
+  const useMeter = c.meter !== false;
+  const expected = c.expect.records ?? [];
+
+  switch (c.mode) {
+    case "consume": {
+      const envelope = EnvelopeCodec.make("urn:acme:a", {}, { queue: "placeholder" });
+      envelope.attempts = c.attempts ?? 0;
+      const meta = envelope.meta as unknown as Record<string, unknown>;
+      if (c.queue === undefined) delete meta.queue;
+      else meta.queue = c.queue;
+      const handle = wrapHandler(
+        tracer,
+        () => {
+          if (c.outcome === "error") throw new Error("handler failed");
+        },
+        undefined,
+        { system: c.system, meter: useMeter ? meter : undefined },
+      );
+      try {
+        await handle(envelope);
+      } catch {
+        // the failure is the case input
+      }
+      return compareRecords(points, expected);
+    }
+    case "publish": {
+      let producedQueue = "";
+      const options: PublishOptions = { system: c.system, meter: useMeter ? meter : undefined };
+      if (c.queue !== undefined) options.queue = c.queue;
+      try {
+        await publish(
+          tracer,
+          "urn:acme:a",
+          {},
+          (envelope) => {
+            producedQueue = envelope.meta.queue;
+            if (c.outcome === "error") throw new Error("transport down");
+          },
+          options,
+        );
+      } catch {
+        // the failure is the case input
+      }
+      return compareRecords(points, expected, producedQueue);
+    }
+    case "dead_letter": {
+      if (c.observer_called === true && c.event !== undefined) {
+        const observe = createDeadLetterObserver({ system: c.system, meter: useMeter ? meter : undefined });
+        await observe({ queue: c.event.queue, deadLetterQueue: c.event.dead_letter_queue, reason: c.event.reason });
+      }
+      // observer_called:false cases (sdk_test_required) are enforced by the transports' own tests; here nothing is delivered.
+      return compareRecords(points, expected);
+    }
+    default:
+      return [`unknown metrics mode ${String(c.mode)}`];
+  }
+}
+
+/** Runs every scenario the `instrument` cases need and checks name, kind, unit, attribute key set and forbidden keys. */
+async function runMetricsInstrument(c: MetricsCase): Promise<string[]> {
+  const violations: string[] = [];
+  const { tracer } = spanRecorder();
+  const { meter, points, created } = inMemoryMeter();
+  const queued = EnvelopeCodec.make("urn:acme:a", {}, { queue: "orders" });
+  queued.attempts = 1;
+  await wrapHandler(tracer, () => undefined, undefined, { system: "kafka", meter })(queued);
+  await wrapHandler(tracer, () => { throw new Error("handler failed"); }, undefined, { system: "kafka", meter })(queued).catch(() => undefined);
+  await publish(tracer, "urn:acme:a", {}, () => undefined, { queue: "orders", system: "kafka", meter });
+  await publish(tracer, "urn:acme:a", {}, () => { throw new Error("transport down"); }, { queue: "orders", system: "kafka", meter }).catch(() => undefined);
+  createDeadLetterObserver({ system: "kafka", meter })({ queue: "orders", deadLetterQueue: "orders.dlq", reason: "failed" });
+
+  const expect = c.expect;
+  const instrument = created.find((i) => i.name === expect.metric);
+  if (instrument === undefined) return [`${String(expect.metric)} was never created`];
+  if (instrument.kind !== expect.instrument) violations.push(`instrument is a ${instrument.kind}`);
+  if (instrument.options?.unit !== expect.unit) violations.push(`unit is ${String(instrument.options?.unit)}`);
+  if (expect.advisory_bucket_boundaries !== undefined) {
+    const advice = instrument.options?.advice?.explicitBucketBoundaries;
+    if (!isDeepStrictEqual(advice, expect.advisory_bucket_boundaries)) violations.push("advisory bucket boundaries differ");
+  }
+  const own = points.filter((p) => p.metric === expect.metric);
+  if (own.length === 0) violations.push("no data point was recorded");
+  const spec = expect.attributes ?? { always: [], when_destination_known: [] };
+  const allowed = new Set([...spec.always, ...spec.when_destination_known, ...(spec.on_failure ?? [])]);
+  const seen = new Set<string>();
+  for (const point of own) {
+    const keys = Object.keys(point.attributes);
+    for (const key of spec.always) if (!keys.includes(key)) violations.push(`${key} is missing from a point`);
+    for (const key of keys) {
+      seen.add(key);
+      if (!allowed.has(key)) violations.push(`${key} is not an attribute of ${String(expect.metric)}`);
+    }
+    if (point.attributes["messaging.operation.name"] !== expect.operation_name) violations.push("messaging.operation.name differs");
+  }
+  for (const key of allowed) if (!seen.has(key)) violations.push(`${key} was never written`);
+  for (const point of points) {
+    for (const forbidden of expect.forbidden_attributes ?? []) {
+      if (forbidden in point.attributes) violations.push(`forbidden attribute ${forbidden} on ${point.metric}`);
+    }
+  }
+  return violations;
+}
+
+for (const c of otelSections.metrics.cases) {
+  test(`conformance metrics: ${c.name}`, () => runCase("metrics", c.name, async () => {
+    assert.deepEqual(c.mode === "instrument" ? await runMetricsInstrument(c) : await runMetricsScenario(c), []);
+  }));
+}
+
 // --- Sections for bindings this package does not carry (ADR-0032 section 2) -----------
 // `delay` (sqs), `backoff` and `kafka_poison` (kafka), `redis_layout`, `redis_delay` and `redis` (redis) are absent from results.json:
 // the schema forbids a section of a binding missing from `bindings`. The transports live in
 // the node-adapters repository, which publishes its own results. Unknown sections are never run.
 
+// `identity_verdict` (core, conformance v1.7.0) has no runner in this package yet: it was added after the
+// v1.6.0 vendor this package last ran against, and writing the runner is the Node parity work, not the OTel plan.
+// The exception is explicit and asserted: once the section is run, this test fails and the entry must go.
+const SECTIONS_NOT_YET_RUN = ["identity_verdict"];
+
 test("conformance results: every in-scope section is run, every case reports once", () => {
   assert.deepEqual(bindings, ["otel"], "this package carries the otel binding only");
-  for (const name of inScopeSections()) {
+  for (const name of SECTIONS_NOT_YET_RUN) {
+    assert.equal(results[name], undefined, `section ${name} is expected to be not run yet`);
+  }
+  for (const name of inScopeSections().filter((n) => !SECTIONS_NOT_YET_RUN.includes(n))) {
     const expected = expectedCaseIds(name).sort();
     const recorded = Object.keys(results[name] ?? {}).sort();
     assert.deepEqual(recorded, expected, `section ${name}`);

@@ -62,15 +62,35 @@ import {
   trace,
   type Attributes,
   type Context,
+  type Counter,
+  type Histogram,
+  type Meter,
+  type Span,
   type SpanContext,
   type Tracer,
 } from "@opentelemetry/api";
 
 import { EnvelopeCodec, type Envelope, type MakeOptions } from "./codec.js";
 import type { HeaderCarrier } from "./contracts.js";
+import type { DeadLetterEvent, DeadLetterObserver } from "./deadLetterObserver.js";
 import type { Handler } from "./idempotency.js";
 
-const SYSTEM = "babelqueue";
+/**
+ * The OpenTelemetry semantic-conventions release the span and metric shapes follow
+ * (ADR-0038 section 1). A later bump is a code + doc change in a MINOR plus a conformance update.
+ */
+export const SEMCONV_VERSION = "1.44.0";
+
+/**
+ * The semantic-conventions schema URL for {@link SEMCONV_VERSION}. The caller creates its tracer
+ * and meter, so it passes this value when it does: `trace.getTracer(name, version, { schemaUrl })`
+ * and `metrics.getMeter(name, version, { schemaUrl })`. The SDK never wraps or replaces a
+ * caller-supplied tracer or meter (ADR-0038 section 1).
+ */
+export const SEMCONV_SCHEMA_URL = `https://opentelemetry.io/schemas/${SEMCONV_VERSION}`;
+
+/** The `messaging.system` value used when no `system` option is given (deprecated default, ADR-0038 section 5). */
+const DEFAULT_SYSTEM = "babelqueue";
 const INVALID_TRACE_ID = "00000000000000000000000000000000";
 const INVALID_SPAN_ID = "0000000000000000";
 
@@ -107,11 +127,50 @@ const TRACEPARENT_REGEX = new RegExp(
  * for the UUID case.
  */
 export function traceIdOf(traceId: string): string {
+  return decodedTraceId(traceId) ?? hashedTraceId(traceId);
+}
+
+/** The 32-hex form of a `trace_id` the mapping decodes directly (hyphens optional, any case), else `undefined`. */
+function decodedTraceId(traceId: string): string | undefined {
   const hex = traceId.replace(/-/g, "").toLowerCase();
-  if (/^[0-9a-f]{32}$/.test(hex) && hex !== INVALID_TRACE_ID) {
-    return hex;
-  }
+  return /^[0-9a-f]{32}$/.test(hex) && hex !== INVALID_TRACE_ID ? hex : undefined;
+}
+
+function hashedTraceId(traceId: string): string {
   return createHash("sha256").update(traceId).digest("hex").slice(0, 32);
+}
+
+/** Hashes (32 hex) of the distinct non-UUID values already warned about; bounded so a producer of random values cannot grow it. */
+const warnedTraceIds = new Set<string>();
+const WARNED_TRACE_IDS_LIMIT = 1024;
+
+/** The `process.emitWarning` code used when the OTel mapping hashes a non-UUID `trace_id` (ADR-0038 section 7). */
+export const NON_UUID_TRACE_ID_WARNING_CODE = "BABELQUEUE_NON_UUID_TRACE_ID";
+
+/**
+ * {@link traceIdOf} for the consumer span's parent, which also warns (once per distinct value, at
+ * most {@link WARNED_TRACE_IDS_LIMIT} values) when the value is hashed instead of decoded
+ * (message-envelope.md section 5.1). The value is preserved on the envelope either way; the
+ * warning only reports that the mapping fell back to the hash.
+ */
+function traceIdForParent(traceId: string): string {
+  const decoded = decodedTraceId(traceId);
+  if (decoded !== undefined) {
+    return decoded;
+  }
+  const hashed = hashedTraceId(traceId);
+  // Keyed by the 32-hex hash, not the raw value: the set stays small however long the trace_id is.
+  if (!warnedTraceIds.has(hashed) && warnedTraceIds.size < WARNED_TRACE_IDS_LIMIT) {
+    warnedTraceIds.add(hashed);
+    if (typeof process !== "undefined" && typeof process.emitWarning === "function") {
+      const shown = traceId.length > 64 ? `${traceId.slice(0, 64)}...` : traceId;
+      process.emitWarning(
+        `BabelQueue: trace_id ${JSON.stringify(shown)} is not a UUID; the OpenTelemetry trace id is the SHA-256 hash of its UTF-8 bytes (first 16 bytes). The value itself is forwarded unchanged.`,
+        { code: NON_UUID_TRACE_ID_WARNING_CODE },
+      );
+    }
+  }
+  return hashed;
 }
 
 /**
@@ -132,7 +191,7 @@ function spanIdOf(traceId: string): string {
 /** A context carrying a remote parent in the `trace_id`-derived trace (v0.1 fallback). */
 function parentContext(traceId: string): Context {
   return trace.setSpanContext(otelContext.active(), {
-    traceId: traceIdOf(traceId),
+    traceId: traceIdForParent(traceId),
     spanId: spanIdOf(traceId),
     traceFlags: TraceFlags.SAMPLED,
     isRemote: true,
@@ -241,15 +300,254 @@ export function remoteParentFromHeaders(
 /*  Producer / consumer wrappers                                              */
 /* -------------------------------------------------------------------------- */
 
-function consumeAttributes(env: Envelope): Attributes {
-  return {
-    "messaging.system": SYSTEM,
+/** Options shared by the producer and consumer wrappers (ADR-0038 section 2, ADR-0039 section 3). */
+export interface OtelOptions {
+  /**
+   * The `messaging.system` value: `"redis"`, `"rabbitmq"`, `"aws_sqs"`, `"servicebus"`, `"pulsar"`,
+   * `"kafka"` or `"activemq"` (ADR-0038 section 3). A value outside that set is written as given.
+   * Absent or empty means `"babelqueue"`, which is **deprecated**: pass the broker so spans and
+   * metrics group by it in APM messaging views.
+   */
+  system?: string;
+  /**
+   * The OpenTelemetry `Meter` the standard metric set is recorded on (ADR-0039). With no meter
+   * the wrapper records no metrics. Create it with {@link SEMCONV_SCHEMA_URL} if you want the
+   * schema URL attached.
+   */
+  meter?: Meter;
+}
+
+/** Options for {@link wrapHandler}. */
+export interface WrapHandlerOptions extends OtelOptions {
+  /**
+   * The `messaging.consumer.group.name` value (intended for Kafka; written whenever given). It is
+   * a span attribute only, never a metric attribute (ADR-0039 section 2).
+   */
+  consumerGroup?: string;
+}
+
+function systemOf(system: string | undefined): string {
+  return system === undefined || system === "" ? DEFAULT_SYSTEM : system;
+}
+
+/** Whether `value` is empty or only ASCII whitespace (the closed set of ADR-0032: space, \t, \n, \v, \f, \r). */
+function isBlank(value: string): boolean {
+  return /^[ \t\n\v\f\r]*$/.test(value);
+}
+
+/** The destination to report: `queue` when it is a non-blank string, else `undefined`. */
+function destinationOf(queue: unknown): string | undefined {
+  return typeof queue === "string" && !isBlank(queue) ? queue : undefined;
+}
+
+/** `<operation> <destination>`, or the bare operation name when there is no destination. */
+function spanNameOf(operation: string, destination: string | undefined): string {
+  return destination === undefined ? operation : `${operation} ${destination}`;
+}
+
+/**
+ * The `error.type` value of a failure (ADR-0038 section 6): the constructor name, else the `name`
+ * property, else `_OTHER` (a thrown non-error value).
+ */
+function errorTypeOf(err: unknown): string {
+  if (err !== null && typeof err === "object") {
+    const constructorName = (err as { constructor?: { name?: unknown } }).constructor?.name;
+    if (typeof constructorName === "string" && constructorName !== "" && constructorName !== "Object") {
+      return constructorName;
+    }
+    const name = (err as { name?: unknown }).name;
+    if (typeof name === "string" && name !== "") {
+      return name;
+    }
+  }
+  return "_OTHER";
+}
+
+/** Record a failure on `span`: the exception event, status Error, and `error.type` (ADR-0038 section 6). */
+function recordFailure(span: Span, err: unknown): string {
+  const errorType = errorTypeOf(err);
+  span.recordException(err instanceof Error ? err : String(err));
+  span.setStatus({
+    code: SpanStatusCode.ERROR,
+    message: err instanceof Error ? err.message : String(err),
+  });
+  span.setAttribute("error.type", errorType);
+  return errorType;
+}
+
+function consumeAttributes(
+  env: Envelope,
+  system: string,
+  destination: string | undefined,
+  consumerGroup: string | undefined,
+): Attributes {
+  const attempts = Number.isInteger(env.attempts) ? env.attempts : 0;
+  const schemaVersion = Number.isInteger(env.meta?.schema_version)
+    ? env.meta.schema_version
+    : EnvelopeCodec.SCHEMA_VERSION;
+  const attributes: Attributes = {
+    "messaging.system": system,
+    "messaging.operation.type": "process",
+    "messaging.operation.name": "process",
+    "babelqueue.urn": EnvelopeCodec.urn(env),
+    "babelqueue.schema_version": schemaVersion,
+    "babelqueue.attempts": attempts,
+    // Deprecated keys, dual-emitted for one MINOR (ADR-0038 section 5).
     "messaging.operation": "process",
-    "messaging.destination.name": env.meta?.queue ?? "",
-    "messaging.message.id": env.meta?.id ?? "",
-    "messaging.message.conversation_id": env.trace_id,
-    "messaging.babelqueue.attempts": env.attempts ?? 0,
+    "messaging.babelqueue.attempts": attempts,
   };
+  if (destination !== undefined) {
+    attributes["messaging.destination.name"] = destination;
+  }
+  const messageId = env.meta?.id;
+  if (typeof messageId === "string" && messageId !== "") {
+    attributes["messaging.message.id"] = messageId;
+  }
+  if (typeof env.trace_id === "string") {
+    attributes["messaging.message.conversation_id"] = env.trace_id;
+  }
+  if (consumerGroup !== undefined) {
+    attributes["messaging.consumer.group.name"] = consumerGroup;
+  }
+  return attributes;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Metrics (ADR-0039)                                                        */
+/* -------------------------------------------------------------------------- */
+
+/** The semconv advisory bucket boundaries of `messaging.process.duration`, in seconds. */
+const PROCESS_DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10];
+
+interface ConsumerInstruments {
+  processDuration: Histogram;
+  consumed: Counter;
+  retries: Counter;
+}
+
+interface ProducerInstruments {
+  sent: Counter;
+}
+
+// One set of instruments per meter, created on first use (ADR-0039 section 3: once, not per message).
+const consumerInstruments = new WeakMap<Meter, ConsumerInstruments>();
+const producerInstruments = new WeakMap<Meter, ProducerInstruments>();
+const deadLetterCounters = new WeakMap<Meter, Counter>();
+
+function consumerInstrumentsOf(meter: Meter): ConsumerInstruments {
+  let instruments = consumerInstruments.get(meter);
+  if (instruments === undefined) {
+    instruments = {
+      processDuration: meter.createHistogram("messaging.process.duration", {
+        description: "Duration of processing operations.",
+        unit: "s",
+        advice: { explicitBucketBoundaries: PROCESS_DURATION_BUCKETS },
+      }),
+      consumed: meter.createCounter("messaging.client.consumed.messages", {
+        description: "Number of messages that were delivered to the application.",
+        unit: "{message}",
+      }),
+      retries: meter.createCounter("babelqueue.retries", {
+        description: "Number of deliveries that were redeliveries (top-level attempts > 0).",
+        unit: "{message}",
+      }),
+    };
+    consumerInstruments.set(meter, instruments);
+  }
+  return instruments;
+}
+
+function producerInstrumentsOf(meter: Meter): ProducerInstruments {
+  let instruments = producerInstruments.get(meter);
+  if (instruments === undefined) {
+    instruments = {
+      sent: meter.createCounter("messaging.client.sent.messages", {
+        description: "Number of messages producer attempted to send to the broker.",
+        unit: "{message}",
+      }),
+    };
+    producerInstruments.set(meter, instruments);
+  }
+  return instruments;
+}
+
+function deadLetterCounterOf(meter: Meter): Counter {
+  let counter = deadLetterCounters.get(meter);
+  if (counter === undefined) {
+    counter = meter.createCounter("babelqueue.dlq.messages", {
+      description: "Number of messages the SDK dead-lettered.",
+      unit: "{message}",
+    });
+    deadLetterCounters.set(meter, counter);
+  }
+  return counter;
+}
+
+/**
+ * The metric attribute set (ADR-0039 section 2): system, operation name, the destination when
+ * known, and `error.type` on failure. Nothing else is ever a metric attribute.
+ */
+function metricAttributes(
+  system: string,
+  operationName: string,
+  destination: string | undefined,
+  errorType?: string,
+): Attributes {
+  const attributes: Attributes = {
+    "messaging.system": system,
+    "messaging.operation.name": operationName,
+  };
+  if (destination !== undefined) {
+    attributes["messaging.destination.name"] = destination;
+  }
+  if (errorType !== undefined) {
+    attributes["error.type"] = errorType;
+  }
+  return attributes;
+}
+
+/**
+ * A {@link DeadLetterObserver} that increments `babelqueue.dlq.messages` (ADR-0039 section 5.1):
+ * `messaging.system` is the `system` option, `messaging.destination.name` is the event's source
+ * queue (when known) and `messaging.operation.name` is `process`. With no `meter` it records
+ * nothing. The observer never throws: a failing meter cannot change how a message is settled.
+ *
+ * Wiring it into a transport's dead-letter write point is the transport package's job.
+ */
+export function createDeadLetterObserver(options: OtelOptions = {}): DeadLetterObserver {
+  const { meter } = options;
+  if (meter === undefined) {
+    return () => undefined;
+  }
+  const system = systemOf(options.system);
+  return (event: DeadLetterEvent): void => {
+    try {
+      deadLetterCounterOf(meter).add(1, metricAttributes(system, "process", destinationOf(event.queue)));
+    } catch {
+      // Metrics must never change the settle outcome (ADR-0039 section 5.1, isolation).
+    }
+  };
+}
+
+/** Resolve instruments without letting a failing meter change the wrapped call: `undefined` means "record nothing". */
+function instrumentsOrUndefined<T>(meter: Meter | undefined, resolve: (meter: Meter) => T): T | undefined {
+  if (meter === undefined) {
+    return undefined;
+  }
+  try {
+    return resolve(meter);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Never lets a failing meter change the wrapped call's outcome. */
+function safely(record: () => void): void {
+  try {
+    record();
+  } catch {
+    // swallow: metrics observe, they never alter settlement (ADR-0039 context)
+  }
 }
 
 /**
@@ -268,8 +566,19 @@ async function resolveHeaders(source: DeliveredHeaders): Promise<HeaderCarrier |
 }
 
 /**
- * Wrap a consume handler to emit a CONSUMER span per message, recording the handler's
- * error/status. The handler receives the full {@link Envelope} as before.
+ * Wrap a consume handler to emit a CONSUMER span `process <queue>` per message, recording the
+ * handler's error/status. The handler receives the full {@link Envelope} as before.
+ *
+ * The span follows the OpenTelemetry messaging semantic conventions v1.44.0 (ADR-0038): the
+ * destination is the delivered envelope's `meta.queue` (no destination, and a bare `process`
+ * name, when it is absent or blank), `messaging.system` is `options.system`, the BabelQueue
+ * identity is in `babelqueue.*`, and a failing handler sets status Error plus `error.type`. The
+ * deprecated `messaging.operation` and `messaging.babelqueue.attempts` keys are dual-emitted for
+ * one MINOR.
+ *
+ * With `options.meter`, it also records `messaging.client.consumed.messages`, `babelqueue.retries`
+ * (when `attempts > 0`) and `messaging.process.duration` (ADR-0039). The handler's result, or the
+ * error it throws, is passed through unchanged.
  *
  * **Parent selection (ADR-0028):** when the adapter supplies the delivered message's
  * out-of-band headers via `headers` and they carry a valid W3C `traceparent`, the span is
@@ -286,23 +595,43 @@ export function wrapHandler(
   tracer: Tracer,
   handler: Handler,
   headers?: DeliveredHeaders,
+  options: WrapHandlerOptions = {},
 ): (env: Envelope) => Promise<void> {
+  const system = systemOf(options.system);
+  const consumerGroup = options.consumerGroup === undefined || options.consumerGroup === "" ? undefined : options.consumerGroup;
+  const instruments = instrumentsOrUndefined(options.meter, consumerInstrumentsOf);
   return async (env: Envelope): Promise<void> => {
     const delivered = await resolveHeaders(headers);
     const ctx = remoteParentFromHeaders(delivered) ?? parentContext(env.trace_id);
+    const destination = destinationOf(env.meta?.queue);
+    const attempts = Number.isInteger(env.attempts) ? env.attempts : 0;
+    if (instruments !== undefined) {
+      const attributes = metricAttributes(system, "process", destination);
+      safely(() => {
+        instruments.consumed.add(1, attributes);
+        if (attempts > 0) {
+          instruments.retries.add(1, attributes);
+        }
+      });
+    }
+    const started = performance.now();
     return tracer.startActiveSpan(
-      `process ${env.job ?? ""}`,
-      { kind: SpanKind.CONSUMER, attributes: consumeAttributes(env) },
+      spanNameOf("process", destination),
+      { kind: SpanKind.CONSUMER, attributes: consumeAttributes(env, system, destination, consumerGroup) },
       ctx,
       async (span) => {
+        let errorType: string | undefined;
         try {
           await handler(env);
         } catch (err) {
-          span.recordException(err as Error);
-          span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+          errorType = recordFailure(span, err);
           throw err;
         } finally {
           span.end();
+          if (instruments !== undefined) {
+            const seconds = Math.max(0, (performance.now() - started) / 1000);
+            safely(() => instruments.processDuration.record(seconds, metricAttributes(system, "process", destination, errorType)));
+          }
         }
       },
     );
@@ -310,7 +639,7 @@ export function wrapHandler(
 }
 
 /** Options for {@link publish}. */
-export interface PublishOptions extends MakeOptions {
+export interface PublishOptions extends MakeOptions, OtelOptions {
   /**
    * An out-of-band {@link HeaderCarrier} to receive the active producer span's W3C
    * `traceparent` (and `tracestate`). The adapter passes a carrier here and carries the same
@@ -322,7 +651,8 @@ export interface PublishOptions extends MakeOptions {
 }
 
 /**
- * Run a publish under a PRODUCER span `publish <urn>`, propagating the trace downstream two ways:
+ * Run a publish under a PRODUCER span `send <queue>` (ADR-0038), propagating the trace
+ * downstream two ways:
  *
  *   - **W3C `traceparent` (ADR-0028, v0.2):** when `options.headers` is supplied, the active
  *     span context is injected into that carrier as a `traceparent` (and `tracestate`) header.
@@ -334,7 +664,14 @@ export interface PublishOptions extends MakeOptions {
  *     envelope's `trace_id`, so even a consumer that ignores the header — or a transport that
  *     drops it — recovers the same trace (correlation without the exact span edge).
  *
- * `send` performs the real transport write and its result is returned.
+ * The destination is the queue the message is published to: `options.queue`, or `default` when
+ * none is given — what `make` writes into `meta.queue`. A blank queue means no destination and a
+ * bare `send` name. `options.system` is the `messaging.system` value (absent: the deprecated
+ * `babelqueue`). With `options.meter`, `messaging.client.sent.messages` is incremented once per
+ * call, success or failure (ADR-0039). The URN is only in `babelqueue.urn`, never in the span name.
+ *
+ * `send` performs the real transport write and its result is returned; a failure is rethrown
+ * unchanged after the span records it.
  */
 export function publish<R>(
   tracer: Tracer,
@@ -343,34 +680,47 @@ export function publish<R>(
   send: (envelope: Envelope) => R | Promise<R>,
   options: PublishOptions = {},
 ): Promise<R> {
+  const { headers, system: systemOption, meter, ...makeOptions } = options;
+  const system = systemOf(systemOption);
+  const destination = destinationOf(makeOptions.queue ?? "default");
+  const instruments = instrumentsOrUndefined(meter, producerInstrumentsOf);
+  const urnAttribute = EnvelopeCodec.urn({ job: urn }) || urn;
+  const attributes: Attributes = {
+    "messaging.system": system,
+    "messaging.operation.type": "send",
+    "messaging.operation.name": "send",
+    "babelqueue.urn": urnAttribute,
+    "babelqueue.schema_version": EnvelopeCodec.SCHEMA_VERSION,
+    // Deprecated key, dual-emitted for one MINOR (ADR-0038 section 5).
+    "messaging.operation": "publish",
+  };
+  if (destination !== undefined) {
+    attributes["messaging.destination.name"] = destination;
+  }
   return tracer.startActiveSpan(
-    `publish ${urn}`,
-    {
-      kind: SpanKind.PRODUCER,
-      attributes: {
-        "messaging.system": SYSTEM,
-        "messaging.operation": "publish",
-        "messaging.destination.name": urn,
-      },
-    },
+    spanNameOf("send", destination),
+    { kind: SpanKind.PRODUCER, attributes },
     async (span) => {
+      let errorType: string | undefined;
       try {
         const traceId = uuidOf(span.spanContext().traceId);
-        if (options.headers) {
+        if (headers) {
           // Inject from a context built explicitly from *this* producer span — not the ambient
           // active context, which is unreliable unless a global ContextManager is registered.
-          injectTraceparent(options.headers, trace.setSpan(otelContext.active(), span));
+          injectTraceparent(headers, trace.setSpan(otelContext.active(), span));
         }
-        const envelope = EnvelopeCodec.make(urn, data, { ...options, traceId });
-        const result = await send(envelope);
+        const envelope = EnvelopeCodec.make(urn, data, { ...makeOptions, traceId });
         span.setAttribute("messaging.message.id", envelope.meta.id);
-        return result;
+        span.setAttribute("messaging.message.conversation_id", envelope.trace_id);
+        return await send(envelope);
       } catch (err) {
-        span.recordException(err as Error);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        errorType = recordFailure(span, err);
         throw err;
       } finally {
         span.end();
+        if (instruments !== undefined) {
+          safely(() => instruments.sent.add(1, metricAttributes(system, "send", destination, errorType)));
+        }
       }
     },
   );
