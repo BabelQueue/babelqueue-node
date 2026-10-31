@@ -49,8 +49,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
   emits a `BABELQUEUE_NON_UUID_TRACE_ID` process warning once per distinct value
   (message-envelope.md section 5.1). `traceIdOf` itself is unchanged.
 - Conformance runner covers the v1.9.0 `span-shape`, `trace-id` and `metrics` sections (plus the six
-  new `traceparent` cases); the vendored suite is now 1.9.0. The v1.7.0 core section
-  `identity_verdict` has no runner in this package yet (to be added with the Node parity work).
+  new `traceparent` cases); the vendored suite is now 1.9.0.
+- `classifyBody(raw)` and the `BodyVerdict` type (ADR-0036 decision 4, ADR-0032 section 6): a strict,
+  never-throwing classifier that returns `{ verdict: "ok" }` for a body that decodes into an envelope
+  with a valid identity and `{ verdict: "poison", cause }` otherwise (not one JSON object, a wrongly
+  typed known member such as `attempts: "3"` or `data: []`, or no valid `job` / `urn`). It lets a
+  consumer park a malformed body on the poison route. **`EnvelopeCodec.decode` is unchanged**: it
+  stays lenient about member types and keeps its signature and behaviour.
+  A body nested deeper than 10000 levels is poison; the depth limit differs per SDK (Go 10000, PHP 511, Java 256,
+  .NET 64, Python interpreter-dependent), recorded in ADR-0036 decision 4 "SDK note".
+- Conformance runner covers the v1.7.0 core section `identity_verdict` (97 cases, all passing); it was
+  the last section not run by this package.
 
 ## [1.13.0] - 2026-10-24
 

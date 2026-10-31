@@ -38,6 +38,9 @@ export type { RetryBackoffOptions, RetryJitter } from "./backoff.js";
 
 export { buildPoisonRecord } from "./poisonRecord.js";
 
+export { classifyBody } from "./bodyVerdict.js";
+export type { BodyVerdict } from "./bodyVerdict.js";
+
 export type { DeadLetterEvent, DeadLetterObserver } from "./deadLetterObserver.js";
 
 export { annotate } from "./deadLetter.js";

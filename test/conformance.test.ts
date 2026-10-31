@@ -29,6 +29,7 @@ import {
   Wrap,
   annotate,
   buildPoisonRecord,
+  classifyBody,
   retryBackoffDelay,
 } from "../src/index.js";
 import type { Envelope } from "../src/index.js";
@@ -992,10 +993,17 @@ interface MetricsCase {
   };
 }
 
+interface IdentityVerdictCase {
+  name: string;
+  body: string;
+  expect: "ok" | "poison";
+}
+
 const otelSections = fullManifest as unknown as {
   "span-shape": { cases: SpanShapeCase[] };
   "trace-id": { cases: TraceIdCase[] };
   metrics: { cases: MetricsCase[] };
+  identity_verdict: { cases: IdentityVerdictCase[] };
 };
 
 /** The ADR-0038 section 4 attribute keys: a key the case does not list must be absent from the span. */
@@ -1418,17 +1426,95 @@ for (const c of otelSections.metrics.cases) {
 // the schema forbids a section of a binding missing from `bindings`. The transports live in
 // the node-adapters repository, which publishes its own results. Unknown sections are never run.
 
-// `identity_verdict` (core, conformance v1.7.0) has no runner in this package yet: it was added after the
-// v1.6.0 vendor this package last ran against, and writing the runner is the Node parity work, not the OTel plan.
-// The exception is explicit and asserted: once the section is run, this test fails and the entry must go.
-const SECTIONS_NOT_YET_RUN = ["identity_verdict"];
+// --- identity_verdict (core scope, conformance v1.7.0; ADR-0036 decision 4) ---------------
+// Each case's raw `body` goes to the strict body classifier `classifyBody`, which must give the verdict `expect`.
+// `EnvelopeCodec.decode` is not the oracle: it is lenient about the type of a known member (it keeps
+// `attempts: "3"` and `data: []` as parsed), so it would say `ok` where the suite expects `poison`.
+
+for (const c of otelSections.identity_verdict.cases) {
+  test(`conformance identity_verdict: ${c.name}`, () => runCase("identity_verdict", c.name, () => {
+    const verdict = classifyBody(c.body);
+    assert.equal(verdict.verdict, c.expect, `body ${JSON.stringify(c.body)}: ${verdict.verdict === "poison" ? verdict.cause : "ok"}`);
+  }));
+}
+
+test("identity_verdict: the section holds the 97 cases of conformance v1.7.0 or later", () => {
+  assert.equal(otelSections.identity_verdict.cases.length, 97);
+});
+
+test("classifyBody: a poison verdict carries a cause, an ok verdict carries none", () => {
+  assert.deepEqual(classifyBody('{"job":"urn:x"}'), { verdict: "ok" });
+  for (const body of ["", "not-json", "[]", "null", "{}", '{"job":5}', '{"job":"urn:x","attempts":"3"}', '{"job":"urn:x","data":[]}']) {
+    const verdict = classifyBody(body);
+    assert.equal(verdict.verdict, "poison", body);
+    assert.ok(verdict.verdict === "poison" && verdict.cause.length > 0, body);
+  }
+});
+
+test("classifyBody leaves EnvelopeCodec.decode lenient: the wrongly typed body still decodes, the verdict is poison", () => {
+  for (const body of ['{"job":"urn:x","attempts":"3"}', '{"job":"urn:x","data":[]}']) {
+    const envelope = EnvelopeCodec.decode(body, { onWarning: () => undefined });
+    assert.equal(EnvelopeCodec.urn(envelope), "urn:x");
+    assert.equal(classifyBody(body).verdict, "poison");
+  }
+  assert.equal(EnvelopeCodec.decode('{"job":"urn:x","attempts":"3"}').attempts, "3");
+});
+
+// The conformance cases of the typed members are identity-less, so they are poison for that reason alone. These bodies
+// carry a valid identity, so only the member-type rule can make them poison.
+test("classifyBody: a wrong typed known member of an identified body is poison and names the member path", () => {
+  const cases: Array<[string, string]> = [
+    ['{"job":"urn:x","trace_id":7}', "trace_id"],
+    ['{"job":"urn:x","attempts":1.5}', "attempts"],
+    ['{"job":"urn:x","attempts":9223372036854775808}', "attempts"],
+    ['{"job":"urn:x","meta":"x"}', "meta"],
+    ['{"job":"urn:x","meta":{"id":5}}', "meta.id"],
+    ['{"job":"urn:x","meta":{"queue":5}}', "meta.queue"],
+    ['{"job":"urn:x","meta":{"lang":true}}', "meta.lang"],
+    ['{"job":"urn:x","meta":{"schema_version":"1"}}', "meta.schema_version"],
+    ['{"job":"urn:x","meta":{"created_at":1.5}}', "meta.created_at"],
+    ['{"job":"urn:x","meta":{"created_at":9223372036854775808}}', "meta.created_at"],
+    ['{"job":"urn:x","dead_letter":[]}', "dead_letter"],
+    ['{"job":"urn:x","dead_letter":{"reason":5}}', "dead_letter.reason"],
+    ['{"job":"urn:x","dead_letter":{"lang":{}}}', "dead_letter.lang"],
+    ['{"job":"urn:x","dead_letter":{"failed_at":1.5}}', "dead_letter.failed_at"],
+    ['{"job":"urn:x","dead_letter":{"attempts":"3"}}', "dead_letter.attempts"],
+    ['{"job":"urn:x","data":{"n":1e400}}', "data"],
+  ];
+  for (const [body, member] of cases) {
+    const verdict = classifyBody(body);
+    assert.equal(verdict.verdict, "poison", body);
+    assert.ok(verdict.verdict === "poison" && verdict.cause.includes(`'${member}'`), `${body}: ${JSON.stringify(verdict)}`);
+  }
+});
+
+test("classifyBody: well typed members of an identified body are ok (schema_version is not checked)", () => {
+  for (const body of [
+    '{"job":"urn:x","meta":{"schema_version":2}}',
+    '{"job":"urn:x","meta":{"created_at":9223372036854775807,"id":null}}',
+    '{"job":"urn:x","dead_letter":{"failed_at":1,"error":null}}',
+    '{"job":"urn:x","data":{"n":1e300}}',
+  ]) {
+    assert.deepEqual(classifyBody(body), { verdict: "ok" }, body);
+  }
+});
+
+test("classifyBody: a duplicated identity key keeps its last value", () => {
+  assert.equal(classifyBody('{"job":5,"job":"urn:x"}').verdict, "ok");
+  assert.equal(classifyBody('{"job":"urn:x","job":5}').verdict, "poison");
+});
+
+test("classifyBody never throws, including on a deeply nested or lone-surrogate body", () => {
+  const nested = `{"job":"urn:x","x":${"[".repeat(5000)}${"]".repeat(5000)}}`;
+  assert.equal(classifyBody(nested).verdict, "ok");
+  assert.equal(classifyBody(`{"job":"urn:x","x":${"[".repeat(20000)}${"]".repeat(20000)}}`).verdict, "poison");
+  assert.equal(classifyBody('{"job":"urn:x","\\ud800":1}').verdict, "ok");
+  assert.equal(classifyBody(undefined as unknown as string).verdict, "poison");
+});
 
 test("conformance results: every in-scope section is run, every case reports once", () => {
   assert.deepEqual(bindings, ["otel"], "this package carries the otel binding only");
-  for (const name of SECTIONS_NOT_YET_RUN) {
-    assert.equal(results[name], undefined, `section ${name} is expected to be not run yet`);
-  }
-  for (const name of inScopeSections().filter((n) => !SECTIONS_NOT_YET_RUN.includes(n))) {
+  for (const name of inScopeSections()) {
     const expected = expectedCaseIds(name).sort();
     const recorded = Object.keys(results[name] ?? {}).sort();
     assert.deepEqual(recorded, expected, `section ${name}`);
