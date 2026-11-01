@@ -9,6 +9,60 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-11-01
+
+### Changed — dashboard-breaking (`@babelqueue/core/otel`, ADR-0038)
+- **Span names:** `publish <urn>` is now `send <queue>` and `process <urn>` is now `process <queue>`.
+  With no destination (a blank `meta.queue` on consume) the name is the bare `send` / `process`. The
+  URN is never in the span name; it is the `babelqueue.urn` attribute.
+- **Producer destination:** `messaging.destination.name` on the producer span is now the queue the
+  message is published to (`queue` option, else `default`), no longer the URN. Update saved queries.
+- **`messaging.system`:** with the new `system` option it is the broker (`redis`, `rabbitmq`,
+  `aws_sqs`, `servicebus`, `pulsar`, `kafka`, `activemq`; any other value is written as given).
+  **Without `system` it stays `babelqueue`, and that default is deprecated** — pass `system`.
+- `messaging.operation.type` / `messaging.operation.name` (`send` or `process`) are written; the
+  `babelqueue.urn`, `babelqueue.schema_version` and `babelqueue.attempts` attributes carry the
+  BabelQueue identity. `messaging.message.id` is written only when `meta.id` is present, and on a
+  producer span as soon as the envelope is built (also when the send then fails). The consumer span
+  no longer writes empty strings for a missing destination or id.
+- A failing publish or handler now also sets `error.type` (the error's constructor name, else its
+  `name`, else `_OTHER`); status Error and the recorded exception are unchanged, and the error is
+  rethrown as before.
+- **Deprecated keys, dual-emitted for this MINOR only:** `messaging.operation` (`publish` /
+  `process`) and `messaging.babelqueue.attempts`. The next MINOR removes both.
+
+### Added
+- `publish(...)` options: `system`, `meter`. `wrapHandler(tracer, handler, headers?, options?)`
+  options: `system`, `consumerGroup` (`messaging.consumer.group.name`), `meter`. Existing calls keep
+  working unchanged.
+- `SEMCONV_VERSION` (`"1.44.0"`) and `SEMCONV_SCHEMA_URL` (`https://opentelemetry.io/schemas/1.44.0`):
+  pass the schema URL when you create your tracer or meter (`getTracer(name, version, { schemaUrl })`).
+- Standard metrics (ADR-0039), recorded only when a `meter` is passed (`@opentelemetry/api` stays an
+  optional peer dependency; no new runtime dependency): `messaging.process.duration` (histogram, `s`,
+  advisory buckets), `messaging.client.sent.messages`, `messaging.client.consumed.messages` and
+  `babelqueue.retries` (counters, `{message}`). Attributes are `messaging.system`,
+  `messaging.operation.name`, `messaging.destination.name` (when known) and `error.type` (on failure
+  of the duration and sent metrics); never the URN, message id, `trace_id` or attempts.
+- Dead-letter observer seam (ADR-0039 section 5.1): the `DeadLetterObserver` and `DeadLetterEvent`
+  types in the core (`@babelqueue/core`), and `createDeadLetterObserver({ system, meter })` in
+  `@babelqueue/core/otel`, which counts `babelqueue.dlq.messages`. The Node core has no consume
+  runtime; wiring the observer into the transport packages is the node-adapters' job.
+- A non-UUID `trace_id` is forwarded unchanged; the OTel parent mapping (SHA-256 hash, as before) now
+  emits a `BABELQUEUE_NON_UUID_TRACE_ID` process warning once per distinct value
+  (message-envelope.md section 5.1). `traceIdOf` itself is unchanged.
+- Conformance runner covers the v1.9.0 `span-shape`, `trace-id` and `metrics` sections (plus the six
+  new `traceparent` cases); the vendored suite is now 1.9.0.
+- `classifyBody(raw)` and the `BodyVerdict` type (ADR-0036 decision 4, ADR-0032 section 6): a strict,
+  never-throwing classifier that returns `{ verdict: "ok" }` for a body that decodes into an envelope
+  with a valid identity and `{ verdict: "poison", cause }` otherwise (not one JSON object, a wrongly
+  typed known member such as `attempts: "3"` or `data: []`, or no valid `job` / `urn`). It lets a
+  consumer park a malformed body on the poison route. **`EnvelopeCodec.decode` is unchanged**: it
+  stays lenient about member types and keeps its signature and behaviour.
+  A body nested deeper than 10000 levels is poison; the depth limit differs per SDK (Go 10000, PHP 511, Java 256,
+  .NET 64, Python interpreter-dependent), recorded in ADR-0036 decision 4 "SDK note".
+- Conformance runner covers the v1.7.0 core section `identity_verdict` (97 cases, all passing); it was
+  the last section not run by this package.
+
 ## [1.13.0] - 2026-10-24
 
 ### Added
