@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-11-01
+
 ### Changed — dashboard-breaking (`@babelqueue/core/otel`, ADR-0038)
 - **Span names:** `publish <urn>` is now `send <queue>` and `process <urn>` is now `process <queue>`.
   With no destination (a blank `meta.queue` on consume) the name is the bare `send` / `process`. The
