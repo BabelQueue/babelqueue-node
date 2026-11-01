@@ -70,7 +70,7 @@
     "@types/node": "^22",
     "c8": "^11.0.0",
     "eslint": "^10.4.1",
-    "tsup": "^8",
+    "tsup": "^9",
     "tsx": "^4",
     "typescript": "^5.5",
     "typescript-eslint": "^8.60.1"
