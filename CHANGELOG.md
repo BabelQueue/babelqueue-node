@@ -27,6 +27,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `meta.id` (an adapter `publish(urn, data)` would build a second envelope with a different id). No API change here —
   docs and a test only. No wire or envelope change (`schema_version` stays 1).
 
+### Fixed
+- **`schema`: a fractional `minLength` / `maxLength` is truncated toward zero** (`2.5` is `2`) before the comparison, like the
+  Go, PHP, Python and Java validators, so `{"type":"string","minLength":2.5}` accepts `"ab"` on every SDK. A non-finite bound
+  (`NaN`, `±Infinity`; only reachable from a hand-built schema) is ignored. No wire or envelope change (`schema_version`
+  stays 1).
+
 ### Changed
 - Vendored conformance suite bumped to 1.10.0; the runner executes the new `payload_schema_keywords` section.
 

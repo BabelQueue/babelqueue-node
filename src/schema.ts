@@ -319,12 +319,14 @@ export function validateSchema(schema: SchemaNode, value: unknown, path = ""): s
       // Length is counted in Unicode code points (not UTF-16 code units), so an
       // astral character such as an emoji counts once — the cross-SDK rule.
       const length = codePointLength(str);
+      // A fractional bound is truncated toward zero (2.5 -> 2), as Go, PHP, Python and Java do;
+      // a non-finite one (NaN / +-Infinity, only reachable from a hand-built schema) is ignored.
       const minLength = schema.minLength;
-      if (typeof minLength === "number" && length < minLength) {
+      if (typeof minLength === "number" && Number.isFinite(minLength) && length < Math.trunc(minLength)) {
         return violation(path, "below_min_length");
       }
       const maxLength = schema.maxLength;
-      if (typeof maxLength === "number" && length > maxLength) {
+      if (typeof maxLength === "number" && Number.isFinite(maxLength) && length > Math.trunc(maxLength)) {
         return violation(path, "above_max_length");
       }
       return null;
