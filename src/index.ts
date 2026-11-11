@@ -61,7 +61,14 @@ export type { Handler, Store } from "./idempotency.js";
 
 export * as schema from "./schema.js";
 export { sensitivePaths } from "./schema.js";
-export type { SchemaProvider, SchemaNode, SensitivePath } from "./schema.js";
+export type {
+  MapProviderOptions,
+  RegisteredSchemaWarning,
+  SchemaNode,
+  SchemaProvider,
+  SchemaWarning,
+  SensitivePath,
+} from "./schema.js";
 
 export * as gdpr from "./gdpr.js";
 export {
