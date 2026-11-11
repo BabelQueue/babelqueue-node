@@ -151,6 +151,37 @@ test("publish emits a PRODUCER span and stamps trace_id from it", async () => {
   assert.equal(traceIdOf(sent.trace_id), span.spanContext().traceId);
 });
 
+test("publish hands one envelope to a publishEnvelope-style target: span id == wire meta.id, headers carried out of band", async () => {
+  const { tracer, exporter } = recorder();
+  const headers: HeaderCarrier = {};
+  // An adapter stand-in: sends a ready envelope as-is (never rebuilds it) beside the carrier.
+  const wire: { body: string; headers: HeaderCarrier }[] = [];
+  const target = {
+    publishEnvelope(envelope: Envelope, options: { headers?: HeaderCarrier } = {}): string {
+      wire.push({ body: EnvelopeCodec.encode(envelope), headers: { ...options.headers } });
+      return envelope.meta.id;
+    },
+  };
+
+  const id = await publish(
+    tracer,
+    "urn:babel:orders:created",
+    { order_id: 7 },
+    (env) => target.publishEnvelope(env, { headers }),
+    { queue: "orders", headers },
+  );
+
+  assert.equal(wire.length, 1);
+  const decoded = EnvelopeCodec.decode(wire[0]!.body) as Envelope;
+  const span = exporter.getFinishedSpans()[0]!;
+  assert.equal(span.attributes["messaging.message.id"], decoded.meta.id);
+  assert.equal(id, decoded.meta.id);
+  assert.equal(decoded.meta.schema_version, 1);
+  assert.equal(decoded.trace_id, uuidOf(span.spanContext().traceId));
+  assert.match(wire[0]!.headers[HEADER_TRACEPARENT] ?? "", /^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
+  assert.ok(!wire[0]!.body.includes(HEADER_TRACEPARENT), "the traceparent never enters the envelope body");
+});
+
 test("publish records a failing send on the span and re-throws", async () => {
   const { tracer, exporter } = recorder();
   const boom = new Error("send failed");

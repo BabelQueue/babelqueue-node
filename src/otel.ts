@@ -672,6 +672,17 @@ export interface PublishOptions extends MakeOptions, OtelOptions {
  *
  * `send` performs the real transport write and its result is returned; a failure is rethrown
  * unchanged after the span records it.
+ *
+ * `send` receives the **one** envelope this function built — the same object whose `meta.id` was
+ * just written to the span's `messaging.message.id`. Hand that envelope to the adapter's
+ * `publishEnvelope(envelope, { headers })` (every `@babelqueue/*` transport package has one) so it
+ * goes to the wire as-is; calling the adapter's `publish(urn, data)` instead would build a second
+ * envelope with a different `meta.id`, and the span would no longer match the wire.
+ *
+ * `publishEnvelope` sends the envelope as given and does not stamp `meta.queue`, so pass
+ * `options.queue` equal to the publisher's destination: without it `make` writes `meta.queue:
+ * "default"`, which names the span `send default` and makes a dead-letter record's
+ * `original_queue` (and a redrive) point at the wrong queue.
  */
 export function publish<R>(
   tracer: Tracer,
