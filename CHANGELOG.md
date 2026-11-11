@@ -21,6 +21,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `unsupportedKeywords(schema)` helper is exported too. Annotation keywords (`$schema`, `$id`, `title`,
   `description`, `examples`, `default`, `$comment`, `x-*`) never warn. No wire or envelope change
   (`schema_version` stays 1).
+- **`@babelqueue/core/otel`: `publish` documents the `publishEnvelope` hand-off.** The `send` callback already
+  receives the one envelope the span's `messaging.message.id` was taken from; every adapter transport package now has
+  a `publishEnvelope(envelope, { headers })` that sends that envelope as-is, so the producer span id equals the wire
+  `meta.id` (an adapter `publish(urn, data)` would build a second envelope with a different id). No API change here —
+  docs and a test only. No wire or envelope change (`schema_version` stays 1).
 
 ### Changed
 - Vendored conformance suite bumped to 1.10.0; the runner executes the new `payload_schema_keywords` section.
