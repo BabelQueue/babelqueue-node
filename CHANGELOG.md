@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-11-11
+
 ### Added
 - **`schema`: payload-validator parity with the other SDKs (ADR-0024; conformance 1.10.0 `payload_schema_keywords`).**
   `type` may now be an array (`["string","null"]`; a value is valid when it matches any listed type, and
