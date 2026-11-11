@@ -9,6 +9,22 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **`schema`: payload-validator parity with the other SDKs (ADR-0024; conformance 1.10.0 `payload_schema_keywords`).**
+  `type` may now be an array (`["string","null"]`; a value is valid when it matches any listed type, and
+  `integer` accepts `1.0` and `1e2`); `const` / `enum` compare numbers by mathematical value (`1` = `1.0` = `1e0`,
+  a `bigint` included), recursively in arrays and objects (object key order is irrelevant), while a boolean or a
+  string never equals a number; `maxLength` is enforced in Unicode code points. A keyword outside the supported
+  subset still never changes a verdict, but registering a schema in a `MapProvider` now reports one warning per
+  occurrence: `{ urn, pointer, keyword }` through the new `onWarning` option (default: `process.emitWarning` with
+  the code `BABELQUEUE_UNSUPPORTED_SCHEMA_KEYWORD`, once per message) and on `MapProvider.warnings`; the pure
+  `unsupportedKeywords(schema)` helper is exported too. Annotation keywords (`$schema`, `$id`, `title`,
+  `description`, `examples`, `default`, `$comment`, `x-*`) never warn. No wire or envelope change
+  (`schema_version` stays 1).
+
+### Changed
+- Vendored conformance suite bumped to 1.10.0; the runner executes the new `payload_schema_keywords` section.
+
 ## [1.14.0] - 2026-11-01
 
 ### Changed — dashboard-breaking (`@babelqueue/core/otel`, ADR-0038)

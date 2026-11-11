@@ -35,7 +35,7 @@ import {
 import type { Envelope } from "../src/index.js";
 import { createDeadLetterObserver, publish, remoteParentFromHeaders, traceIdOf, wrapHandler } from "../src/otel.js";
 import type { PublishOptions } from "../src/otel.js";
-import { validateSchema } from "../src/schema.js";
+import { MapProvider, validateSchema } from "../src/schema.js";
 import type { SchemaNode } from "../src/schema.js";
 
 interface ConformanceCase {
@@ -577,7 +577,16 @@ const nodeSections = fullManifest as unknown as {
   };
   payload_schema: { schema: SchemaNode; cases: PayloadSchemaCase[] };
   payload_schema_unicode: { schema: SchemaNode; cases: PayloadSchemaCase[] };
+  payload_schema_keywords: { cases: PayloadKeywordsCase[] };
 };
+
+interface PayloadKeywordsCase {
+  name: string;
+  schema: SchemaNode;
+  data: unknown;
+  valid: boolean;
+  warnings?: Array<{ pointer: string; keyword: string }>;
+}
 
 interface RetryBackoffCase {
   name: string;
@@ -926,6 +935,23 @@ for (const section of ["payload_schema", "payload_schema_unicode"] as const) {
       assert.equal(verdict, c.valid, c.name);
     }));
   }
+}
+
+// payload_schema_keywords (ADR-0024, K-17): each case carries its own schema. A case passes when
+// the verdict AND the registration warnings (a set of {pointer, keyword}, never the message text)
+// match; the warnings come from registering the schema in a MapProvider, the SDK's registration point.
+const pairKey = (w: { pointer: string; keyword: string }): string => JSON.stringify([w.pointer, w.keyword]);
+for (const c of nodeSections.payload_schema_keywords.cases) {
+  test(`conformance payload_schema_keywords: ${c.name}`, () => runCase("payload_schema_keywords", c.name, () => {
+    const reported: string[] = [];
+    const registered = new MapProvider({ "urn:babel:conformance:keywords": c.schema }, {
+      onWarning: (warning) => reported.push(pairKey(warning)),
+    });
+    assert.equal(validateSchema(c.schema, c.data) === null, c.valid, `${c.name}: verdict`);
+    const expected = (c.warnings ?? []).map(pairKey);
+    assert.deepEqual([...reported].sort(), [...expected].sort(), `${c.name}: warnings`);
+    assert.deepEqual(registered.warnings.map(pairKey).sort(), [...expected].sort(), `${c.name}: provider.warnings`);
+  }));
 }
 
 // --- otel: span-shape, trace-id, metrics (conformance v1.9.0, ADR-0038 / ADR-0039) -------------
