@@ -187,6 +187,31 @@ test("maxLength counts Unicode code points", () => {
   assert.notEqual(validateSchema(node('{"type":"string","maxLength":1}'), "e\u0301"), null, "decomposed é is 2 code points");
 });
 
+test("a fractional minLength/maxLength is truncated toward zero, like Go/PHP/Python", () => {
+  const min = node('{"type":"string","minLength":2.5}');
+  assert.equal(validateSchema(min, "ab"), null, "minLength 2.5 behaves as 2");
+  assert.notEqual(validateSchema(min, "a"), null);
+  const max = node('{"type":"string","maxLength":2.9}');
+  assert.equal(validateSchema(max, "ab"), null, "maxLength 2.9 behaves as 2");
+  assert.notEqual(validateSchema(max, "abc"), null);
+  // A negative fractional bound truncates to 0 (not -0.5): only the empty string fits maxLength.
+  const negMax = node('{"type":"string","maxLength":-0.5}');
+  assert.equal(validateSchema(negMax, ""), null);
+  assert.notEqual(validateSchema(negMax, "a"), null);
+  assert.equal(validateSchema(node('{"type":"string","minLength":-0.5}'), ""), null);
+});
+
+test("a non-finite minLength/maxLength (NaN, +-Infinity) is ignored", () => {
+  for (const keyword of ["minLength", "maxLength"]) {
+    for (const bound of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const s = { type: "string", [keyword]: bound } as never;
+      for (const text of ["", "a", "abc"]) {
+        assert.equal(validateSchema(s, text), null, `${keyword}=${bound} ${JSON.stringify(text)}`);
+      }
+    }
+  }
+});
+
 test("const/enum compare numbers by value, recursively, and keep types apart", () => {
   const one = node('{"const":1}');
   for (const v of [1, 1.0, JSON.parse("1e0"), JSON.parse("1.0"), 1n]) {
